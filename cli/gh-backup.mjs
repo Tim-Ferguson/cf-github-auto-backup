@@ -150,11 +150,13 @@ function loadState() {
 	return {
 		url: process.env.GH_BACKUP_URL ?? state.url ?? null,
 		password: process.env.GH_BACKUP_PASSWORD ?? state.password ?? state.adminToken ?? null,
+		// The Worker's name, which decides its workers.dev address.
+		name: process.env.GH_BACKUP_NAME ?? state.name ?? null,
 	};
 }
 
 function saveState(state) {
-	writeFileSync(STATE_FILE, JSON.stringify({ url: state.url, password: state.password }, null, "\t") + "\n", { mode: 0o600 });
+	writeFileSync(STATE_FILE, JSON.stringify({ url: state.url, password: state.password, ...(state.name ? { name: state.name } : {}) }, null, "\t") + "\n", { mode: 0o600 });
 	chmodSync(STATE_FILE, 0o600);
 }
 
@@ -286,22 +288,27 @@ async function choosePassword(state) {
 	ok("Saved to .gh-backup.json (git-ignored, readable only by you)");
 }
 
-async function deploy(state) {
-	step("4. Deploying to Cloudflare");
-	if (state.url && !(await confirm(`Deploy again to ${state.url}?`, true))) return;
-
+/** Runs `cf deploy` with the password as a secret and returns the Worker's address. */
+async function runDeploy(state) {
 	// The password travels in a private temp file, never on a command line.
 	const dir = mkdtempSync(join(tmpdir(), "gh-backup-"));
 	const secretsFile = join(dir, "secrets.json");
 	let result;
 	try {
 		writeFileSync(secretsFile, JSON.stringify({ ADMIN_PASSWORD: state.password }), { mode: 0o600 });
-		result = await cf(["deploy", "--secrets-file", secretsFile], { show: true });
+		result = await cf(["deploy", "--secrets-file", secretsFile], { show: true, env: state.name ? { GH_BACKUP_NAME: state.name } : {} });
 	} finally {
 		rmSync(dir, { recursive: true, force: true });
 	}
 	if (result.code !== 0) throw new Abort("The deploy failed; see the output above.");
-	const found = /https:\/\/[a-z0-9-]+(?:\.[a-z0-9-]+)*\.workers\.dev/i.exec(result.out)?.[0];
+	return /https:\/\/[a-z0-9-]+(?:\.[a-z0-9-]+)*\.workers\.dev/i.exec(result.out)?.[0] ?? null;
+}
+
+async function deploy(state) {
+	step("4. Deploying to Cloudflare");
+	if (state.url && !(await confirm(`Deploy again to ${state.url}?`, true))) return;
+
+	const found = await runDeploy(state);
 	state.url = (await ask("Worker URL:", { fallback: found ?? state.url ?? "" })).replace(/\/+$/, "");
 	if (!/^https:\/\//.test(state.url)) throw new Abort("A https:// URL is needed.");
 	saveState(state);
@@ -503,8 +510,61 @@ async function clone(state, term) {
 	say(dim("\n--mirror also brings pull request heads and the kept snapshots of rewritten or deleted history."));
 }
 
+/** Gives the deployment a new name, and so a new workers.dev address, keeping all its data. */
+async function move(state, wanted) {
+	const oldName = state.name ?? "gh-backup";
+	const oldUrl = state.url;
+	const name = wanted ?? `gh-backup-${randomBytes(4).toString("hex")}`;
+	if (!/^[a-z0-9][a-z0-9-]{0,53}$/.test(name)) throw new Abort("Use lower-case letters, digits and hyphens for the name.");
+	if (name === oldName) throw new Abort("That is already this deployment's name.");
+
+	const before = await api(state, "/status");
+	const busy = before.repos.filter((r) => r.last_status === "running" || r.last_status === "queued").length;
+	say(`\nThis moves the deployment from ${bold(oldName)} to ${bold(name)}.`);
+	say("Backups, settings and the password stay as they are. The old address stops working.");
+	if (busy) warn(`${busy} sync(s) are still in progress and will be cut short; they run again on the next schedule.`);
+	if (!(await confirm("Go ahead?"))) return;
+
+	step("1. Deploying under the new name");
+	state.name = name;
+	saveState(state);
+	const url = await runDeploy(state);
+	if (!url) throw new Abort("Deployed, but the new address was not in the output. Find it in the Cloudflare dashboard and put it in .gh-backup.json as \"url\".");
+	state.url = url;
+	saveState(state);
+	await waitUntilReady(state);
+
+	step("2. Removing the old deployment");
+	const removed = [];
+	if ((await cf(["workers", "delete", oldName, "--force"])).code === 0) removed.push("Worker");
+	if ((await cf(["workflows", "delete", `${oldName}-backup`, "--force"])).code === 0) removed.push("workflow");
+	const apps = await cf(["containers", "applications", "list"]);
+	try {
+		const list = JSON.parse(apps.out.slice(apps.out.indexOf("[")));
+		const old = list.find((a) => a.name === `${oldName}-git-runner`);
+		if (old && (await cf(["containers", "applications", "delete", old.id, "--force"])).code === 0) removed.push("container");
+	} catch {
+		// Listing failed; reported below.
+	}
+	if (removed.includes("Worker")) ok(`Removed the old ${removed.join(", ")}`);
+	else warn(`Could not remove the old Worker "${oldName}". Delete it in the Cloudflare dashboard, or ${oldUrl} keeps working.`);
+
+	const after = await api(state, "/status");
+	step("Moved");
+	say(`New address: ${bold(state.url)}`);
+	ok(`${after.repos.filter((r) => r.backed_up).length} repositories still backed up`);
+	if (after.mode === "app") {
+		ok("GitHub push notifications now point at the new address");
+		say(`\nOne thing GitHub only lets you change by hand. Open ${bold(`https://github.com/settings/apps/${after.app_slug}`)} and set:`);
+		say(`  Callback URL:  ${state.url}/auth/callback`);
+		say(`  Setup URL:     ${state.url}/setup/installed`);
+		say(dim('Until then "Sign in with GitHub" and "Add account or org" will not work; the password does.'));
+	}
+}
+
 const COMMANDS = {
 	setup,
+	move: (state, name) => move(state, name),
 	restore: (state, _term, args = []) => restore({ state, api, say, step, ok, warn, ask, confirm, findRepo, Abort, dim, bold }, args),
 	status,
 	accounts,
@@ -537,6 +597,7 @@ async function menu(state) {
 			{ value: "clone", label: "Get a clone command for a repository" },
 			{ value: "restore", label: "Restore a repository to GitHub", hint: "history, issues, releases, wiki, LFS, into the account gh is signed in to" },
 			{ value: "open", label: "Open the dashboard" },
+			{ value: "move", label: "Change the address", hint: "new name and workers.dev URL, same data" },
 			{ value: "setup", label: "Run setup again", hint: "redeploy or reconnect" },
 			{ value: null, label: "Quit" },
 		]);
@@ -555,7 +616,7 @@ async function main() {
 	const arg = rest.find((a) => !a.startsWith("--"));
 	const state = loadState();
 	if (command === "help" || command === "--help" || command === "-h") {
-		say("Usage: npm run cli [-- setup | status | accounts | discover | sync [repo] | clone [repo] | restore [repo] | open]");
+		say("Usage: npm run cli [-- setup | status | accounts | discover | sync [repo] | clone [repo] | restore [repo] | move [name] | open]");
 		return say("       restore options: --to owner/name  --private | --public  --skip-issues  --skip-releases  --dry-run  --yes");
 	}
 	if (command && !COMMANDS[command]) throw new Abort(`Unknown command "${command}". Try: npm run cli -- help`);

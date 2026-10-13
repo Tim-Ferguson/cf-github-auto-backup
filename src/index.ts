@@ -1,4 +1,4 @@
-import { hmacHex, randomToken, sha256Hex, sign, timingSafeEqual, unsign } from "./crypto.ts";
+import { appJwt, hmacHex, randomToken, sha256Hex, sign, timingSafeEqual, unsign } from "./crypto.ts";
 import { ensureSchema, getAccount, getAllConfig, getConfig, getRepo, isBackedUp, listAccounts, listRepos, type Repo, type Run, setConfig, updateRepo } from "./db.ts";
 import { discover, queueDue, startBackup } from "./discovery.ts";
 import { type AppConfig, type Deployment, gh, GitHubError, loadDeployment } from "./github.ts";
@@ -86,6 +86,29 @@ async function refresh(env: Env, dep: Deployment, trigger: string): Promise<{ ac
 
 const refreshLater = (env: Env, ctx: ExecutionContext, dep: Deployment, trigger: string) =>
 	ctx.waitUntil(refresh(env, dep, trigger).catch((err) => console.error(`refresh (${trigger}) failed`, err)));
+
+/**
+ * Notices when the deployment is being served from a new address (it was
+ * renamed or given a custom domain) and points the GitHub App's webhook at
+ * it. The app's sign-in callback can only be changed by hand on GitHub, so
+ * the old address is remembered for a reminder on the dashboard.
+ */
+async function adoptOrigin(env: Env, dep: Deployment, origin: string): Promise<void> {
+	const known = await getConfig(env.DB, "base_url");
+	if (known === origin) return;
+	try {
+		if (dep.app) {
+			await gh(await appJwt(dep.app.appId, dep.app.privateKey), "/app/hook/config", {
+				method: "PATCH",
+				headers: { "Content-Type": "application/json" },
+				body: JSON.stringify({ url: `${origin}/webhooks/github` }),
+			});
+		}
+		await setConfig(env.DB, { base_url: origin, ...(known && dep.app ? { moved_from: known } : {}) });
+	} catch (err) {
+		console.error("could not point the GitHub App at the new address", err);
+	}
+}
 
 // --- Actions shared by the dashboard forms and the JSON API ---
 
@@ -271,6 +294,7 @@ async function handleApi(request: Request, env: Env, url: URL, dep: Deployment |
 	}
 
 	if (path === "/status" && !post) {
+		if (dep) await adoptOrigin(env, dep, url.origin);
 		const [accounts, repos, config] = await Promise.all([listAccounts(env.DB), listRepos(env.DB), getAllConfig(env.DB)]);
 		const byLogin = new Map(accounts.map((a) => [a.login, a]));
 		return json({
@@ -355,9 +379,15 @@ async function handleApp(request: Request, env: Env, ctx: ExecutionContext, url:
 		return flash("/", "Installation updated. Repositories will appear here within a minute; reload to see them.");
 	}
 
+	if (path === "/dismiss-move" && post) {
+		await setConfig(env.DB, { moved_from: null });
+		return redirect("/");
+	}
+
 	if (path === "/" && !post) {
+		await adoptOrigin(env, dep, url.origin);
 		const [accounts, repos, config] = await Promise.all([listAccounts(env.DB), listRepos(env.DB), getAllConfig(env.DB)]);
-		return dashboardPage({ owner: dep.owner, signedInAs: signedInAs === ADMIN ? "the password" : `GitHub (${signedInAs})`, slug: dep.app?.slug ?? null, accounts, repos, config, flash: message });
+		return dashboardPage({ origin: url.origin, owner: dep.owner, signedInAs: signedInAs === ADMIN ? "the password" : `GitHub (${signedInAs})`, slug: dep.app?.slug ?? null, accounts, repos, config, flash: message });
 	}
 
 	if (path === "/discover" && post) {

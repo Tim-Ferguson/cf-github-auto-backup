@@ -210,6 +210,7 @@ function accountTitle(account: Account): Html {
 }
 
 export interface DashboardData {
+	origin: string;
 	owner: string;
 	signedInAs: string;
 	/** GitHub App slug, or null when a plain token is used instead. */
@@ -268,6 +269,12 @@ export function dashboardPage(d: DashboardData): Response {
 	</div>
 </header>
 ${d.flash ? html`<div class="flash">${d.flash}</div>` : ""}
+${
+	d.config.moved_from && d.slug
+		? html`<div class="flash"><b>This backup moved here from ${d.config.moved_from}.</b> Push notifications already point at the new address. To keep "Sign in with GitHub" and "Add account or org" working, open <a class="link" href="https://github.com/settings/apps/${d.slug}">the app's settings on GitHub</a> and set <b>Callback URL</b> to <code>${d.origin}/auth/callback</code> and <b>Setup URL</b> to <code>${d.origin}/setup/installed</code>. Signing in with the password is unaffected.
+	<form method="post" action="/dismiss-move"><button type="submit">Done</button></form></div>`
+		: ""
+}
 ${d.config.github_error ? html`<div class="banner"><b class="bad">GitHub has been refusing this app since ${d.config.github_error_since}.</b><br>Nothing has been deleted: every backup below is frozen as it was and can still be cloned from Cloudflare.<br><span class="muted small">${d.config.github_error}</span></div>` : ""}
 <div class="tiles">
 	<div class="tile"><b>${active.length}</b><span class="muted">repos backed up</span></div>

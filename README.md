@@ -98,6 +98,17 @@ The deployment is protected by the `ADMIN_PASSWORD` secret from its very first r
 
 Once the GitHub App exists you can also sign in with GitHub; only the account that created the app is let in.
 
+### Changing the address
+
+The address is `https://<name>.<your account>.workers.dev`, and the name defaults to `gh-backup`, which is easy to guess. To change it, or if the address has been shared somewhere it should not have been:
+
+```sh
+npm run cli -- move              # picks a random name such as gh-backup-3f9a1c2e
+npm run cli -- move my-own-name
+```
+
+This deploys under the new name, checks it, and removes the old Worker. Backups, settings and the password are untouched, because storage is named independently of the Worker. The name is saved in `.gh-backup.json`, so later deploys from that folder keep using it. With a GitHub App, push notifications are re-pointed automatically; GitHub only lets you change the app's Callback URL and Setup URL by hand, and the CLI prints exactly what to paste.
+
 ### Connecting GitHub
 
 | | GitHub App (recommended) | Token from `gh` | Pasted token |
@@ -119,6 +130,7 @@ npm run cli -- sync [repo]     # sync everything, or one repo
 npm run cli -- discover        # refresh the repo list from GitHub
 npm run cli -- clone [repo]    # print a ready-to-paste clone command
 npm run cli -- restore [repo]  # put a backup back on GitHub (see Restoring)
+npm run cli -- move [name]     # change the Worker's name and address, keeping all data
 npm run cli -- open            # open the dashboard
 ```
 
@@ -235,6 +247,7 @@ One real run, on one personal account, set up with the CLI and a GitHub App:
 - **Every ref verified**: all 100 branches and 55 pull request heads (`refs/pull/*`) in Artifacts were compared with GitHub and matched.
 - **Restore**: a repository cloned back from Cloudflare with the dashboard's clone command was complete and matched GitHub.
 - **Metadata**: issues, pull requests, comments and labels were written to R2.
+- **Changing the address**: `move` redeployed a live instance under a new name with all 60 backups intact, removed the old Worker, re-pointed the GitHub webhook, and a full sync then succeeded on the new one.
 - **Sign-in rate limit** (tested locally, since testing it live would lock out the tester): the sixth wrong password from an address is refused for 15 minutes, other addresses are unaffected, and a correct password resets the count.
 - **Dashboard filter**: search and the status filters, checked in headless Chrome.
 - **Issue and pull request browser**: lists, search and thread pages rendered from a real backup.
