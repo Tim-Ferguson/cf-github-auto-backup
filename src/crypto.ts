@@ -19,6 +19,10 @@ function hex(buf: ArrayBuffer): string {
 	return [...new Uint8Array(buf)].map((b) => b.toString(16).padStart(2, "0")).join("");
 }
 
+export async function sha256Hex(text: string): Promise<string> {
+	return hex(await crypto.subtle.digest("SHA-256", encoder.encode(text)));
+}
+
 async function hmacKey(secret: string): Promise<CryptoKey> {
 	return crypto.subtle.importKey("raw", encoder.encode(secret), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
 }

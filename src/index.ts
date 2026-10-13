@@ -1,7 +1,7 @@
-import { hmacHex, randomToken, sign, timingSafeEqual, unsign } from "./crypto.ts";
-import { ensureSchema, getAccount, getAllConfig, getConfig, getRepo, isBackedUp, listAccounts, listRepos, type Run, setConfig, updateRepo } from "./db.ts";
+import { hmacHex, randomToken, sha256Hex, sign, timingSafeEqual, unsign } from "./crypto.ts";
+import { ensureSchema, getAccount, getAllConfig, getConfig, getRepo, isBackedUp, listAccounts, listRepos, type Repo, type Run, setConfig, updateRepo } from "./db.ts";
 import { discover, queueDue, startBackup } from "./discovery.ts";
-import { type AppConfig, gh, loadApp } from "./github.ts";
+import { type AppConfig, type Deployment, gh, GitHubError, loadDeployment } from "./github.ts";
 import { type CloneInfo, dashboardPage, loginPage, messagePage, repoPage, setupPage } from "./ui.ts";
 
 export { GitRunner } from "./runner.ts";
@@ -10,6 +10,8 @@ export { BackupWorkflow } from "./workflow.ts";
 const SESSION_COOKIE = "ghb_session";
 const STATE_COOKIE = "ghb_state";
 const SESSION_TTL = 30 * 24 * 60 * 60;
+/** Session identity of someone who signed in with the CLI's admin token. */
+const ADMIN = "*admin";
 
 function cookie(request: Request, name: string): string | undefined {
 	for (const part of (request.headers.get("Cookie") ?? "").split(/;\s*/)) {
@@ -29,8 +31,10 @@ function redirect(location: string, cookies: string[] = []): Response {
 }
 
 const flash = (path: string, message: string) => redirect(`${path}?m=${encodeURIComponent(message)}`);
+const json = (body: unknown, status = 200) => Response.json(body, { status, headers: { "cache-control": "no-store" } });
+const errorText = (err: unknown) => (err instanceof Error ? err.message : String(err));
 
-/** Signs cookies before the GitHub App exists, and sessions afterwards. */
+/** Signs cookies. Created on first use, before anything else is configured. */
 async function sessionSecret(db: D1Database): Promise<string> {
 	const existing = await getConfig(db, "session_secret");
 	if (existing) return existing;
@@ -48,14 +52,67 @@ async function checkState(request: Request, secret: string, state: string | null
 	return !!saved && !!state && timingSafeEqual(saved.state, state);
 }
 
-async function refresh(env: Env, app: AppConfig, trigger: string): Promise<void> {
-	await discover(env, app);
-	await queueDue(env, trigger);
+async function isAdminToken(adminHash: string | undefined, token: string | null | undefined): Promise<boolean> {
+	return !!adminHash && !!token && timingSafeEqual(adminHash, await sha256Hex(token));
 }
 
-async function handleSetup(request: Request, env: Env, url: URL): Promise<Response> {
-	const secret = await sessionSecret(env.DB);
+async function refresh(env: Env, dep: Deployment, trigger: string): Promise<{ accounts: number; repos: number; queued: number }> {
+	const found = await discover(env, dep);
+	return { ...found, queued: await queueDue(env, trigger) };
+}
 
+const refreshLater = (env: Env, ctx: ExecutionContext, dep: Deployment, trigger: string) =>
+	ctx.waitUntil(refresh(env, dep, trigger).catch((err) => console.error(`refresh (${trigger}) failed`, err)));
+
+// --- Actions shared by the dashboard forms and the JSON API ---
+
+async function setAccount(env: Env, login: string, fields: { enabled?: unknown; include_forks?: unknown }): Promise<boolean> {
+	if (!(await getAccount(env.DB, login))) return false;
+	for (const field of ["enabled", "include_forks"] as const) {
+		const value = fields[field];
+		if (value === undefined || value === null) continue;
+		const on = value === true || value === 1 || value === "1";
+		await env.DB.prepare(`UPDATE accounts SET ${field} = ? WHERE login = ?`).bind(on ? 1 : 0, login).run();
+	}
+	return true;
+}
+
+function parseOverride(value: unknown): 0 | 1 | null {
+	if (value === 1 || value === "1" || value === true) return 1;
+	if (value === 0 || value === "0" || value === false) return 0;
+	return null;
+}
+
+async function cloneCommands(env: Env, repo: Repo): Promise<CloneInfo[]> {
+	const out: CloneInfo[] = [];
+	if (!repo.artifacts_name) return out;
+	for (const [label, name] of [
+		["Repository", repo.artifacts_name],
+		["Wiki", `${repo.artifacts_name}.wiki`],
+	]) {
+		let handle: ArtifactsRepo;
+		try {
+			handle = await env.ARTIFACTS.get(name);
+		} catch {
+			continue;
+		}
+		try {
+			const info = await handle.info();
+			if (!info.lastPushAt) continue;
+			const token = await handle.createToken("read", 3600);
+			// Basic auth takes the token without its ?expires= suffix.
+			const secret = token.plaintext.split("?")[0];
+			out.push({ label, command: `git clone --mirror https://x:${secret}@${info.remote.replace(/^https:\/\//, "")}`, expiresAt: token.expiresAt });
+		} finally {
+			handle[Symbol.dispose]();
+		}
+	}
+	return out;
+}
+
+// --- GitHub App creation (browser) ---
+
+async function handleSetup(request: Request, env: Env, url: URL, secret: string): Promise<Response> {
 	if (url.pathname === "/setup") {
 		const { state, cookie: stateCookie } = await newState(secret);
 		const manifest = {
@@ -107,7 +164,7 @@ async function handleSetup(request: Request, env: Env, url: URL): Promise<Respon
 	return redirect("/setup");
 }
 
-async function handleWebhook(request: Request, env: Env, ctx: ExecutionContext, app: AppConfig): Promise<Response> {
+async function handleWebhook(request: Request, env: Env, ctx: ExecutionContext, dep: Deployment, app: AppConfig): Promise<Response> {
 	const body = await request.text();
 	const expected = `sha256=${await hmacHex(app.webhookSecret, body)}`;
 	if (!timingSafeEqual(expected, request.headers.get("X-Hub-Signature-256") ?? "")) return new Response("bad signature", { status: 401 });
@@ -122,14 +179,15 @@ async function handleWebhook(request: Request, env: Env, ctx: ExecutionContext, 
 			await startBackup(env, repo.id, "push", { force: true, dedupe: `push-${Math.floor(Date.now() / 120_000)}` });
 		}
 	} else if (event === "installation" || event === "installation_repositories" || event === "repository") {
-		ctx.waitUntil(refresh(env, app, "webhook").catch((err) => console.error("refresh after webhook failed", err)));
+		refreshLater(env, ctx, dep, "webhook");
 	}
 	return new Response("ok");
 }
 
-async function handleAuth(request: Request, env: Env, url: URL, app: AppConfig): Promise<Response> {
+/** Sign-in with GitHub, available once a GitHub App exists. */
+async function handleOAuth(request: Request, url: URL, dep: Deployment, app: AppConfig, secret: string): Promise<Response> {
 	if (url.pathname === "/auth/login") {
-		const { state, cookie: stateCookie } = await newState(app.sessionSecret);
+		const { state, cookie: stateCookie } = await newState(secret);
 		const target = new URL("https://github.com/login/oauth/authorize");
 		target.searchParams.set("client_id", app.clientId);
 		target.searchParams.set("redirect_uri", `${url.origin}/auth/callback`);
@@ -137,81 +195,134 @@ async function handleAuth(request: Request, env: Env, url: URL, app: AppConfig):
 		return redirect(target.toString(), [stateCookie]);
 	}
 
-	if (url.pathname === "/auth/callback") {
-		const code = url.searchParams.get("code");
-		if (!code || !(await checkState(request, app.sessionSecret, url.searchParams.get("state")))) {
-			return messagePage("Sign-in expired", "Please try signing in again.", 400, { href: "/auth/login", label: "Sign in" });
+	const code = url.searchParams.get("code");
+	if (!code || !(await checkState(request, secret, url.searchParams.get("state")))) {
+		return messagePage("Sign-in expired", "Please try signing in again.", 400, { href: "/", label: "Sign in" });
+	}
+	const tokenRes = await fetch("https://github.com/login/oauth/access_token", {
+		method: "POST",
+		headers: { Accept: "application/json", "Content-Type": "application/json" },
+		body: JSON.stringify({ client_id: app.clientId, client_secret: app.clientSecret, code, redirect_uri: `${url.origin}/auth/callback` }),
+	});
+	const token = (await tokenRes.json<{ access_token?: string }>()).access_token;
+	if (!token) return messagePage("Sign-in failed", "GitHub did not accept the sign-in. Please try again.", 400, { href: "/", label: "Sign in" });
+	const user = await gh<{ login: string }>(token, "/user");
+	if (user.login.toLowerCase() !== dep.owner.toLowerCase()) {
+		return messagePage("Not your backup", `This deployment belongs to ${dep.owner}. You are signed in to GitHub as ${user.login}.`, 403);
+	}
+	const session = await sign(secret, { login: user.login }, SESSION_TTL);
+	return redirect("/", [setCookie(SESSION_COOKIE, session, SESSION_TTL), setCookie(STATE_COOKIE, "", 0)]);
+}
+
+// --- JSON API for the CLI, authenticated with the admin token ---
+
+async function handleApi(request: Request, env: Env, url: URL, dep: Deployment | null, adminHash: string | undefined): Promise<Response> {
+	const path = url.pathname.slice("/api".length);
+	const post = request.method === "POST";
+	const body = post ? ((await request.json().catch(() => ({}))) as Record<string, unknown>) : {};
+
+	if (path === "/bootstrap" && post) {
+		// Same first-come rule as the browser setup: only an unclaimed
+		// deployment accepts an admin token.
+		if (adminHash || dep) return json({ error: "this deployment is already set up" }, 409);
+		const hash = body.admin_token_hash;
+		if (typeof hash !== "string" || !/^[0-9a-f]{64}$/.test(hash)) return json({ error: "admin_token_hash must be a SHA-256 hex digest" }, 400);
+		await setConfig(env.DB, { admin_token_hash: hash });
+		return json({ ok: true });
+	}
+
+	const bearer = /^Bearer (.+)$/.exec(request.headers.get("Authorization") ?? "")?.[1];
+	if (!(await isAdminToken(adminHash, bearer))) return json({ error: "missing or wrong admin token" }, 401);
+
+	if (path === "/github-token" && post) {
+		const token = body.token;
+		if (typeof token !== "string" || !token) return json({ error: "token is required" }, 400);
+		let user: { login: string };
+		try {
+			user = await gh<{ login: string }>(token, "/user");
+		} catch (err) {
+			return json({ error: `GitHub rejected the token: ${errorText(err)}` }, 400);
 		}
-		const tokenRes = await fetch("https://github.com/login/oauth/access_token", {
-			method: "POST",
-			headers: { Accept: "application/json", "Content-Type": "application/json" },
-			body: JSON.stringify({ client_id: app.clientId, client_secret: app.clientSecret, code, redirect_uri: `${url.origin}/auth/callback` }),
+		if (dep && dep.owner.toLowerCase() !== user.login.toLowerCase()) {
+			return json({ error: `this deployment belongs to ${dep.owner}, but the token is for ${user.login}` }, 409);
+		}
+		await setConfig(env.DB, { github_token: token, owner: user.login });
+		const next = (await loadDeployment(env.DB))!;
+		return json({ owner: user.login, ...(await refresh(env, next, "setup")) });
+	}
+
+	if (path === "/status" && !post) {
+		const [accounts, repos, config] = await Promise.all([listAccounts(env.DB), listRepos(env.DB), getAllConfig(env.DB)]);
+		const byLogin = new Map(accounts.map((a) => [a.login, a]));
+		return json({
+			configured: !!dep,
+			mode: dep?.app ? "app" : dep?.token ? "token" : null,
+			owner: dep?.owner ?? null,
+			app_slug: dep?.app?.slug ?? null,
+			last_discovery_at: config.last_discovery_at ?? null,
+			github_error: config.github_error ?? null,
+			github_error_since: config.github_error_since ?? null,
+			accounts,
+			repos: repos.map((r) => ({ ...r, backed_up: isBackedUp(r, byLogin.get(r.account)) })),
 		});
-		const token = (await tokenRes.json<{ access_token?: string }>()).access_token;
-		if (!token) return messagePage("Sign-in failed", "GitHub did not accept the sign-in. Please try again.", 400, { href: "/auth/login", label: "Sign in" });
-		const user = await gh<{ login: string }>(token, "/user");
-		if (user.login.toLowerCase() !== app.owner.toLowerCase()) {
-			return messagePage("Not your backup", `This deployment belongs to ${app.owner}. You are signed in to GitHub as ${user.login}.`, 403);
-		}
-		const session = await sign(app.sessionSecret, { login: user.login }, SESSION_TTL);
-		return redirect("/", [setCookie(SESSION_COOKIE, session, SESSION_TTL), setCookie(STATE_COOKIE, "", 0)]);
 	}
 
-	return new Response("not found", { status: 404 });
-}
+	if (!dep) return json({ error: "GitHub is not connected yet" }, 409);
 
-async function cloneCommands(env: Env, names: { label: string; name: string }[]): Promise<CloneInfo[]> {
-	const out: CloneInfo[] = [];
-	for (const { label, name } of names) {
-		let repo: ArtifactsRepo;
+	if (path === "/discover" && post) {
 		try {
-			repo = await env.ARTIFACTS.get(name);
-		} catch {
-			continue;
-		}
-		try {
-			const info = await repo.info();
-			if (!info.lastPushAt) continue;
-			const token = await repo.createToken("read", 3600);
-			// Basic auth takes the token without its ?expires= suffix.
-			const secret = token.plaintext.split("?")[0];
-			out.push({ label, command: `git clone --mirror https://x:${secret}@${info.remote.replace(/^https:\/\//, "")}`, expiresAt: token.expiresAt });
-		} finally {
-			repo[Symbol.dispose]();
+			return json(await refresh(env, dep, "manual"));
+		} catch (err) {
+			return json({ error: errorText(err) }, err instanceof GitHubError ? 502 : 500);
 		}
 	}
-	return out;
+	if (path === "/sync-all" && post) return json({ queued: await queueDue(env, "manual", { all: true }) });
+
+	const accountMatch = /^\/accounts\/([^/]+)$/.exec(path);
+	if (accountMatch && post) {
+		if (!(await setAccount(env, decodeURIComponent(accountMatch[1]), body))) return json({ error: "no such account" }, 404);
+		return json(await refresh(env, dep, "settings"));
+	}
+
+	const repoMatch = /^\/repos\/(\d+)(?:\/(sync|clone-token))?$/.exec(path);
+	if (repoMatch && post) {
+		const repo = await getRepo(env.DB, Number(repoMatch[1]));
+		if (!repo) return json({ error: "no such repository" }, 404);
+		if (repoMatch[2] === "sync") {
+			await startBackup(env, repo.id, "manual", { force: true });
+			return json({ ok: true });
+		}
+		if (repoMatch[2] === "clone-token") return json({ storage: repo.storage, clones: await cloneCommands(env, repo) });
+		await updateRepo(env.DB, repo.id, { override: parseOverride(body.override) });
+		return json({ queued: await queueDue(env, "settings") });
+	}
+
+	return json({ error: "not found" }, 404);
 }
 
-async function handleApp(request: Request, env: Env, ctx: ExecutionContext, url: URL, app: AppConfig): Promise<Response> {
+// --- Dashboard ---
+
+async function handleApp(request: Request, env: Env, ctx: ExecutionContext, url: URL, dep: Deployment, signedInAs: string): Promise<Response> {
 	const path = url.pathname;
 	const post = request.method === "POST";
 	const message = url.searchParams.get("m");
 
-	if (post) {
-		// Session cookies are SameSite=Lax; the Origin check covers the rest.
-		if (request.headers.get("Origin") !== url.origin) return new Response("cross-origin request refused", { status: 403 });
-	}
-
 	if (path === "/setup/installed") {
-		ctx.waitUntil(refresh(env, app, "install").catch((err) => console.error("refresh after install failed", err)));
+		refreshLater(env, ctx, dep, "install");
 		return flash("/", "Installation updated. Repositories will appear here within a minute; reload to see them.");
 	}
 
 	if (path === "/" && !post) {
 		const [accounts, repos, config] = await Promise.all([listAccounts(env.DB), listRepos(env.DB), getAllConfig(env.DB)]);
-		return dashboardPage({ owner: app.owner, slug: app.slug, accounts, repos, config, flash: message });
+		return dashboardPage({ owner: dep.owner, signedInAs: signedInAs === ADMIN ? "admin token" : signedInAs, slug: dep.app?.slug ?? null, accounts, repos, config, flash: message });
 	}
-
-	if (path === "/auth/logout" && post) return redirect("/", [setCookie(SESSION_COOKIE, "", 0)]);
 
 	if (path === "/discover" && post) {
 		try {
-			const found = await discover(env, app);
-			const queued = await queueDue(env, "manual");
-			return flash("/", `Found ${found.repos} repositories across ${found.accounts} installation(s); ${queued} sync(s) queued.`);
+			const found = await refresh(env, dep, "manual");
+			return flash("/", `Found ${found.repos} repositories across ${found.accounts} account(s); ${found.queued} sync(s) queued.`);
 		} catch (err) {
-			return flash("/", `GitHub refused the request: ${err instanceof Error ? err.message : err}`);
+			return flash("/", `GitHub refused the request: ${errorText(err)}`);
 		}
 	}
 
@@ -222,13 +333,9 @@ async function handleApp(request: Request, env: Env, ctx: ExecutionContext, url:
 
 	const accountMatch = /^\/accounts\/([^/]+)$/.exec(path);
 	if (accountMatch && post) {
-		const login = decodeURIComponent(accountMatch[1]);
 		const form = await request.formData();
-		for (const field of ["enabled", "include_forks"] as const) {
-			const value = form.get(field);
-			if (value === "0" || value === "1") await env.DB.prepare(`UPDATE accounts SET ${field} = ? WHERE login = ?`).bind(Number(value), login).run();
-		}
-		ctx.waitUntil(refresh(env, app, "settings").catch((err) => console.error("refresh after settings change failed", err)));
+		await setAccount(env, decodeURIComponent(accountMatch[1]), { enabled: form.get("enabled"), include_forks: form.get("include_forks") });
+		refreshLater(env, ctx, dep, "settings");
 		return redirect("/");
 	}
 
@@ -240,8 +347,7 @@ async function handleApp(request: Request, env: Env, ctx: ExecutionContext, url:
 		if (!repo) return messagePage("Not found", "No such repository.", 404, { href: "/", label: "Back" });
 
 		if (action === "override" && post) {
-			const value = (await request.formData()).get("override");
-			await updateRepo(env.DB, id, { override: value === "1" ? 1 : value === "0" ? 0 : null });
+			await updateRepo(env.DB, id, { override: parseOverride((await request.formData()).get("override")) });
 			ctx.waitUntil(queueDue(env, "settings").catch((err) => console.error("queueing after override failed", err)));
 			return redirect("/");
 		}
@@ -251,14 +357,9 @@ async function handleApp(request: Request, env: Env, ctx: ExecutionContext, url:
 		}
 
 		let clones: CloneInfo[] | null = null;
-		if (action === "token" && post && repo.artifacts_name) {
-			clones = await cloneCommands(env, [
-				{ label: "Repository", name: repo.artifacts_name },
-				{ label: "Wiki", name: `${repo.artifacts_name}.wiki` },
-			]);
-		} else if (action) {
-			return redirect(`/repos/${id}`);
-		}
+		if (action === "token" && post) clones = await cloneCommands(env, repo);
+		else if (action) return redirect(`/repos/${id}`);
+
 		const [account, runs, bundles] = await Promise.all([
 			getAccount(env.DB, repo.account),
 			env.DB.prepare(`SELECT * FROM runs WHERE repo_id = ? ORDER BY id DESC LIMIT 20`).bind(id).all<Run>(),
@@ -273,30 +374,55 @@ async function handleApp(request: Request, env: Env, ctx: ExecutionContext, url:
 export default {
 	async fetch(request, env, ctx): Promise<Response> {
 		const url = new URL(request.url);
-		if (url.pathname === "/healthz") return new Response("ok");
+		const path = url.pathname;
+		if (path === "/healthz") return new Response("ok");
 		try {
 			await ensureSchema(env.DB);
-			const app = await loadApp(env.DB);
+			const dep = await loadDeployment(env.DB);
+			const adminHash = (await getConfig(env.DB, "admin_token_hash")) ?? undefined;
 
-			if (!app) return handleSetup(request, env, url);
-			if (url.pathname === "/webhooks/github" && request.method === "POST") return handleWebhook(request, env, ctx, app);
-			if (url.pathname.startsWith("/auth/") && url.pathname !== "/auth/logout") return handleAuth(request, env, url, app);
+			if (path.startsWith("/api/")) return await handleApi(request, env, url, dep, adminHash);
+			if (path === "/webhooks/github" && request.method === "POST" && dep?.app) return await handleWebhook(request, env, ctx, dep, dep.app);
 
-			const session = await unsign<{ login: string }>(app.sessionSecret, cookie(request, SESSION_COOKIE));
-			if (!session || session.login.toLowerCase() !== app.owner.toLowerCase()) {
-				return url.pathname === "/" ? loginPage(app.owner) : redirect("/");
+			// Session cookies are SameSite=Lax; the Origin check covers the rest.
+			if (request.method === "POST" && request.headers.get("Origin") !== url.origin) {
+				return new Response("cross-origin request refused", { status: 403 });
 			}
-			return handleApp(request, env, ctx, url, app);
+
+			const secret = await sessionSecret(env.DB);
+			if (path === "/auth/logout" && request.method === "POST") return redirect("/", [setCookie(SESSION_COOKIE, "", 0)]);
+			if (path === "/auth/token" && request.method === "POST") {
+				const token = (await request.formData()).get("token");
+				if (!(await isAdminToken(adminHash, typeof token === "string" ? token.trim() : null))) {
+					return messagePage("Wrong token", "That is not this deployment's admin token.", 401, { href: "/", label: "Try again" });
+				}
+				return redirect("/", [setCookie(SESSION_COOKIE, await sign(secret, { login: ADMIN }, SESSION_TTL), SESSION_TTL)]);
+			}
+			if ((path === "/auth/login" || path === "/auth/callback") && dep?.app) return await handleOAuth(request, url, dep, dep.app, secret);
+
+			const session = await unsign<{ login: string }>(secret, cookie(request, SESSION_COOKIE));
+			const signedIn = !!session && (session.login === ADMIN ? !!adminHash : !!dep && session.login.toLowerCase() === dep.owner.toLowerCase());
+
+			if (!dep) {
+				// Unclaimed deployments let the first visitor create the GitHub
+				// App. Once the CLI has set an admin token, that token is needed.
+				if (adminHash && !signedIn) return path === "/" ? loginPage(null, { github: false, token: true }) : redirect("/");
+				return await handleSetup(request, env, url, secret);
+			}
+			if (!signedIn) return path === "/" ? loginPage(dep.owner, { github: !!dep.app, token: !!adminHash }) : redirect("/");
+			// A token-mode deployment can still be upgraded to a GitHub App.
+			if (!dep.app && (path === "/setup" || path === "/setup/callback")) return await handleSetup(request, env, url, secret);
+			return await handleApp(request, env, ctx, url, dep, session!.login);
 		} catch (err) {
 			console.error(err);
-			return messagePage("Something went wrong", err instanceof Error ? err.message : String(err), 500, { href: "/", label: "Back" });
+			if (path.startsWith("/api/")) return json({ error: errorText(err) }, 500);
+			return messagePage("Something went wrong", errorText(err), 500, { href: "/", label: "Back" });
 		}
 	},
 
 	async scheduled(_controller, env): Promise<void> {
 		await ensureSchema(env.DB);
-		const app = await loadApp(env.DB);
-		if (!app) return;
-		await refresh(env, app, "schedule");
+		const dep = await loadDeployment(env.DB);
+		if (dep) await refresh(env, dep, "schedule");
 	},
 } satisfies ExportedHandler<Env>;

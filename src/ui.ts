@@ -127,15 +127,25 @@ export function setupPage(origin: string, state: string, manifest: object): Resp
 		<input type="hidden" name="manifest" value="${JSON.stringify(manifest)}">
 		<button class="primary" type="submit">Create the GitHub App</button>
 	</form>
+	<p class="muted small">Prefer the terminal? <code>npm run cli</code> can connect GitHub with a token from the <code>gh</code> CLI instead, with no app at all.</p>
 	<p class="muted small">The app is created as public so that it can also be installed on organizations you belong to. Installations from anyone else show up switched off and are never backed up unless you enable them. Whoever completes this step becomes the owner of this deployment (${origin}).</p>
 </div>`,
 	);
 }
 
-export function loginPage(owner: string): Response {
+export function loginPage(owner: string | null, methods: { github: boolean; token: boolean }): Response {
 	return page(
 		"gh-backup",
-		html`<div class="card"><h1>gh-backup</h1><p>Sign in with GitHub as <b>${owner}</b> to manage this backup.</p><p><a class="btn primary" href="/auth/login">Sign in with GitHub</a></p></div>`,
+		html`<div class="card">
+	<h1>gh-backup</h1>
+	<p>${owner ? html`Sign in to manage the backup of <b>${owner}</b>.` : "This deployment was set up from the command line. Sign in with its admin token to continue."}</p>
+	${methods.github ? html`<p><a class="btn primary" href="/auth/login">Sign in with GitHub</a></p>` : ""}
+	${
+		methods.token
+			? html`<form method="post" action="/auth/token"><p><label for="token" class="muted small">Admin token (printed by <code>npm run cli</code>, stored in <code>.gh-backup.json</code>)</label><br><input id="token" type="password" name="token" autocomplete="current-password" required> <button type="submit" class="${methods.github ? "" : "primary"}">Sign in with token</button></p></form>`
+			: ""
+	}
+</div>`,
 	);
 }
 
@@ -158,7 +168,9 @@ function accountTitle(account: Account): Html {
 
 export interface DashboardData {
 	owner: string;
-	slug: string;
+	signedInAs: string;
+	/** GitHub App slug, or null when a plain token is used instead. */
+	slug: string | null;
 	accounts: Account[];
 	repos: Repo[];
 	config: Record<string, string>;
@@ -204,11 +216,11 @@ export function dashboardPage(d: DashboardData): Response {
 		"gh-backup",
 		html`
 <header class="top">
-	<div><h1>gh-backup</h1><span class="muted small">Signed in as ${d.owner} · checked GitHub ${ago(d.config.last_discovery_at ?? null)}</span></div>
+	<div><h1>gh-backup</h1><span class="muted small">Backing up ${d.owner} · signed in with ${d.signedInAs} · checked GitHub ${ago(d.config.last_discovery_at ?? null)}</span></div>
 	<div class="row">
 		<form method="post" action="/discover"><button type="submit">Refresh from GitHub</button></form>
 		<form method="post" action="/sync-all"><button class="primary" type="submit">Sync everything now</button></form>
-		<a class="btn" href="https://github.com/apps/${d.slug}/installations/new">Add account or org</a>
+		${d.slug ? html`<a class="btn" href="https://github.com/apps/${d.slug}/installations/new">Add account or org</a>` : html`<a class="btn" href="/setup" title="Replace the stored token with a read-only GitHub App that also sends push notifications">Switch to a GitHub App</a>`}
 		<form method="post" action="/auth/logout"><button type="submit">Sign out</button></form>
 	</div>
 </header>
@@ -220,7 +232,7 @@ ${d.config.github_error ? html`<div class="banner"><b class="bad">GitHub has bee
 	<div class="tile"><b>${kept}</b><span class="muted">kept after leaving GitHub</span></div>
 	<div class="tile"><b>${bytes(size)}</b><span class="muted">stored</span></div>
 </div>
-${sections.length ? sections : html`<div class="card"><p>No installations yet. <a class="link" href="https://github.com/apps/${d.slug}/installations/new">Install the app</a> on your account to start.</p></div>`}`,
+${sections.length ? sections : html`<div class="card"><p>Nothing here yet. ${d.slug ? html`<a class="link" href="https://github.com/apps/${d.slug}/installations/new">Install the app</a> on your account to start.` : "Use Refresh from GitHub to list your repositories."}</p></div>`}`,
 	);
 }
 

@@ -1,7 +1,7 @@
 import { WorkflowEntrypoint, type WorkflowEvent, type WorkflowStep } from "cloudflare:workers";
 import { NonRetryableError } from "cloudflare:workflows";
 import { ensureSchema, getAccount, getRepo, isBackedUp, type Repo, STARRED, updateRepo } from "./db.ts";
-import { gitBasicAuth, installationToken, loadApp } from "./github.ts";
+import { gitBasicAuth, loadDeployment, tokenFor } from "./github.ts";
 import { RESOURCES, syncMetadataPage } from "./metadata.ts";
 import { type GitRunner, runnerFor } from "./runner.ts";
 import { copyLfsObjects, type LfsObject, lfsManifestKey, pruneBundles, putRanged, putStream } from "./storage.ts";
@@ -105,9 +105,10 @@ export class BackupWorkflow extends WorkflowEntrypoint<Env, BackupParams> {
 			if (plan.starred) return null;
 			const repo = await getRepo(env.DB, repoId);
 			const account = repo && (await getAccount(env.DB, repo.account));
-			const app = await loadApp(env.DB);
-			if (!app || !account?.installation_id) throw new NonRetryableError(`no GitHub installation for ${plan.fullName}`);
-			return installationToken(app, account.installation_id);
+			const dep = await loadDeployment(env.DB);
+			const token = dep && (await tokenFor(dep, account));
+			if (!token) throw new NonRetryableError(`no GitHub credentials for ${plan.fullName}`);
+			return token;
 		};
 
 		const detail: Record<string, unknown> = {};

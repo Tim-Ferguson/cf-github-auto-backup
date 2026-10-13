@@ -21,23 +21,35 @@ export interface AppConfig {
 	clientId: string;
 	clientSecret: string;
 	webhookSecret: string;
-	owner: string;
-	sessionSecret: string;
 }
 
-export async function loadApp(db: D1Database): Promise<AppConfig | null> {
+/**
+ * How this deployment reads GitHub. Either a GitHub App (read-only,
+ * per-installation tokens, webhooks) or a single token supplied through the
+ * CLI (from `gh auth token` or a personal access token).
+ */
+export interface Deployment {
+	owner: string;
+	app: AppConfig | null;
+	token: string | null;
+}
+
+export async function loadDeployment(db: D1Database): Promise<Deployment | null> {
 	const c = await getAllConfig(db);
-	if (!c.app_id || !c.private_key) return null;
-	return {
-		appId: c.app_id,
-		slug: c.app_slug,
-		privateKey: c.private_key,
-		clientId: c.client_id,
-		clientSecret: c.client_secret,
-		webhookSecret: c.webhook_secret,
-		owner: c.owner,
-		sessionSecret: c.session_secret,
-	};
+	if (!c.owner) return null;
+	const app: AppConfig | null =
+		c.app_id && c.private_key
+			? { appId: c.app_id, slug: c.app_slug, privateKey: c.private_key, clientId: c.client_id, clientSecret: c.client_secret, webhookSecret: c.webhook_secret }
+			: null;
+	const token = c.github_token ?? null;
+	if (!app && !token) return null;
+	return { owner: c.owner, app, token };
+}
+
+/** Token for reading one account's repositories; null means anonymous. */
+export async function tokenFor(dep: Deployment, account: { installation_id: number | null } | null): Promise<string | null> {
+	if (dep.app && account?.installation_id) return installationToken(dep.app, account.installation_id);
+	return dep.token;
 }
 
 export function ghFetch(token: string | null, pathOrUrl: string, init: RequestInit = {}): Promise<Response> {
@@ -105,5 +117,5 @@ export interface GhRepo {
 	has_wiki: boolean;
 	default_branch: string;
 	pushed_at: string | null;
-	owner: { login: string };
+	owner: { login: string; type: "User" | "Organization" };
 }

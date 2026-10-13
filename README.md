@@ -4,7 +4,7 @@ A personal, self-hosted backup of your GitHub repositories that runs entirely in
 
 If GitHub suspends your account tomorrow, you still have every branch, tag, pull request head, issue, review, release and LFS object, and you can `git clone` all of it straight from Cloudflare.
 
-> **Status: untested against live services.** The git mirroring logic, crypto and dashboard are covered by local tests, but this has not yet been deployed end to end against real Cloudflare Artifacts and a real GitHub App. Both Artifacts and the `cf` CLI are in beta. Expect to fix things on the first deploy; see [Known unknowns](#known-unknowns).
+> **Status: untested against live services.** The git mirroring logic, crypto, dashboard, API and CLI are covered by local tests, but this has not yet been deployed end to end against real Cloudflare Artifacts and a real GitHub App. Both Artifacts and the `cf` CLI are in beta. Expect to fix things on the first deploy; see [Known unknowns](#known-unknowns).
 
 ## What gets backed up
 
@@ -38,26 +38,59 @@ Out of the box only your own non-fork repositories are backed up. Everything els
 
 - A Cloudflare account on the **Workers Paid** plan (Artifacts and Containers both need it).
 - **Docker** running locally when you deploy, to build the small git container image.
-- **Node.js 22.18+** and the Cloudflare CLI: `npm install --global cf`.
+- **Node.js 22.18+**. The Cloudflare CLI (`cf`) is installed with the project.
+- Optional: the [GitHub CLI](https://cli.github.com/) if you want to connect GitHub with its token.
 
-## Deploy
+## Quick start
 
 ```sh
-git clone <this repo> && cd gh-backup
+git clone https://github.com/Tim-Ferguson/cf-github-auto-backup && cd cf-github-auto-backup
 npm install
+npm run cli
+```
+
+The CLI walks you through everything and then becomes your control panel:
+
+1. **Checks this machine**: Node, Docker, the `cf` CLI.
+2. **Cloudflare**: signs you in with the browser (`cf auth login`), or takes an API token and account ID and saves them to a git-ignored `.env`. If `CLOUDFLARE_API_TOKEN` is already set, it just uses it.
+3. **Deploys** the Worker, D1 database, R2 bucket and container with `cf deploy`.
+4. **Creates an admin token**, saved to a git-ignored `.gh-backup.json`. It authorizes the CLI and signs you in to the dashboard. Only its hash is stored in Cloudflare.
+5. **GitHub**: pick one of the three ways below.
+6. **What to back up**: switch organizations, forks and starred repos on or off.
+
+### Connecting GitHub
+
+| | GitHub App (recommended) | Token from `gh` | Pasted token |
+| --- | --- | --- | --- |
+| How | Finishes in the browser | Uses `gh auth token` (runs `gh auth login` if needed) | Paste a personal access token |
+| Access | Read-only, only where you install it | Whatever your `gh` sign-in can do, including write | Whatever you grant; fine-grained read-only is best |
+| Sync on push | Yes, by webhook | No, every 6 hours | No, every 6 hours |
+| Dashboard sign-in | GitHub or admin token | Admin token | Admin token |
+
+A token is stored in your D1 database. You can start with a token and switch to a GitHub App later from the dashboard.
+
+### Everyday commands
+
+```sh
+npm run cli                    # interactive menu
+npm run cli -- status          # what is backed up, what is failing
+npm run cli -- accounts        # toggle accounts, orgs, forks, single repos
+npm run cli -- sync [repo]     # sync everything, or one repo
+npm run cli -- discover        # refresh the repo list from GitHub
+npm run cli -- clone [repo]    # print a ready-to-paste restore command
+npm run cli -- open            # open the dashboard
+```
+
+To drive a deployment from another machine or from CI, set `GH_BACKUP_URL` and `GH_BACKUP_ADMIN_TOKEN` instead of using `.gh-backup.json`.
+
+### Without the CLI
+
+```sh
 cf auth login
 cf deploy
 ```
 
-`cf deploy` creates the D1 database, the R2 bucket and the container, and prints your Worker URL. The Artifacts namespace is created on first use.
-
-Then open the Worker URL:
-
-1. Click **Create the GitHub App**. GitHub shows a pre-filled app that can only *read* contents, metadata, issues and pull requests. Confirm it.
-2. Choose where to install it: your account, any organizations, all or selected repositories.
-3. You land on the dashboard and the first backup starts.
-
-Do step 1 right after deploying: whoever completes it becomes the owner of the deployment.
+Then open the Worker URL and click **Create the GitHub App**. Do this right after deploying: on a deployment with no admin token, whoever completes that step becomes the owner.
 
 To add an organization later, use **Add account or org** in the dashboard, then switch that organization on.
 
@@ -71,7 +104,8 @@ dashboard ────────┘                      │
                                          └─▶ GitHub REST API ─▶ R2 (issues, PRs, releases…)
 ```
 
-- **Worker** (`src/index.ts`): dashboard, GitHub App setup and sign-in, webhook receiver, cron.
+- **Worker** (`src/index.ts`): dashboard, GitHub App setup and sign-in, webhook receiver, cron, and the JSON API the CLI talks to.
+- **CLI** (`cli/gh-backup.mjs`): setup wizard and control panel. Plain Node, no dependencies.
 - **Workflow** (`src/workflow.ts`): one durable, retried run per repository. Skips the git step when nothing was pushed since the last sync.
 - **Container** (`container/`): Alpine, git and about 300 lines of Node. It fetches the existing backup from Artifacts, fetches from GitHub on top, snapshots anything that was rewritten or deleted, and pushes the result. Credentials are passed through the environment, never the command line.
 - **D1**: settings, the repo list and run history. **R2**: everything that is not git.
@@ -104,7 +138,8 @@ Everything else is plain files in the R2 bucket `gh-backup-data`:
 ## Security notes
 
 - The GitHub App is read-only and its private key lives in your D1 database, inside your Cloudflare account.
-- Only the GitHub user who created the app can sign in to the dashboard.
+- Only the GitHub user who created the app, or someone holding the admin token, can sign in to the dashboard. The admin token also authorizes the `/api/*` endpoints; keep `.gh-backup.json` private.
+- In token mode the GitHub token sits in D1 in plain text and may carry write access. Prefer the GitHub App, or a fine-grained read-only token.
 - The app is created as *public* because GitHub only allows private apps to be installed on the account that owns them, which would rule out organizations. If a stranger installs it, their account appears in your dashboard switched off and nothing of theirs is backed up unless you turn it on.
 - To start over, delete the rows in the `config` table (`cf d1 query <database id> --sql "DELETE FROM config"`) and delete the app on GitHub.
 

@@ -9,7 +9,8 @@
 		"build": "cf build",
 		"deploy": "cf deploy",
 		"typecheck": "cf workers types && tsc",
-		"test": "node --test"
+		"test": "node --test",
+		"cli": "node cli/gh-backup.mjs"
 	},
 	"dependencies": {
 		"@cloudflare/containers": "^0.3.7"
