@@ -335,9 +335,9 @@ export function repoPage(d: { repo: Repo; account: Account | null; runs: Run[]; 
 	const refs = repo.ref_counts ? (JSON.parse(repo.ref_counts) as Record<string, number>) : null;
 	const backedUp = isBackedUp(repo, d.account ?? undefined);
 	const runRows = d.runs.map((run) => {
-		const detail = run.detail ? (JSON.parse(run.detail) as { error?: string; git?: { updated?: number; newSnapshots?: string[] } | string }) : {};
+		const detail = run.detail ? (JSON.parse(run.detail) as { error?: string; git?: { updated?: number; newSnapshots?: string[]; mode?: string; transferredBytes?: number; fallback?: string } | string }) : {};
 		const git = typeof detail.git === "object" ? detail.git : null;
-		const note = detail.error ?? (detail.git === "unchanged" ? "no new commits; metadata refreshed" : git ? `${git.updated ?? 0} refs updated${git.newSnapshots?.length ? `, ${git.newSnapshots.length} snapshot(s) of rewritten or deleted history kept` : ""}` : "");
+		const note = detail.error ?? (detail.git === "unchanged" ? "no new commits; metadata refreshed" : git ? `${git.updated ?? 0} refs updated${git.newSnapshots?.length ? `, ${git.newSnapshots.length} snapshot(s) of rewritten or deleted history kept` : ""}${git.mode === "incremental" ? ` · fetched ${bytes(git.transferredBytes ?? 0)}` : git.mode === "full" ? " · full sync" : ""}${git.fallback ? ` (${git.fallback.slice(0, 120)})` : ""}` : "");
 		return html`<tr><td>${run.started_at}</td><td>${run.trigger}</td><td class="${run.status === "ok" ? "ok" : run.status === "error" ? "bad" : "muted"}">${run.status}</td><td class="name muted small">${note}</td></tr>`;
 	});
 

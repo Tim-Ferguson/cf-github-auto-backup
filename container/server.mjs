@@ -64,7 +64,7 @@ const server = createServer(async (req, res) => {
 		if (req.method === "GET" && pathname === "/status") {
 			if (!job) return json(res, 200, { state: "idle" });
 			const { id, state, phase, result, error } = job;
-			return json(res, 200, { id, state, phase, error, result: result && { ...result, bundle: result.bundle && { size: result.bundle.size }, lfs: { count: result.lfs.count, bytes: result.lfs.bytes, size: result.lfs.size } } });
+			return json(res, 200, { id, state, phase, error, result: result && { ...result, bundle: result.bundle && { size: result.bundle.size }, lfs: { count: result.lfs.count, bytes: result.lfs.bytes, size: result.lfs.size, incremental: !!result.lfs.incremental } } });
 		}
 		if (req.method === "GET" && pathname === "/lfs.json") {
 			return sendFile(req, res, job?.result?.lfs, "application/json");

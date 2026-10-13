@@ -19,6 +19,8 @@ export async function latestBundle(bucket: R2Bucket, repoId: number): Promise<st
 
 export const lfsKey = (oid: string) => `lfs/${oid.slice(0, 2)}/${oid}`;
 export const lfsManifestKey = (repoId: number) => `lfs-manifests/${repoId}.json`;
+/** The LFS objects the current sync still has to copy. */
+export const lfsPendingKey = (repoId: number) => `lfs-manifests/${repoId}.pending.json`;
 /**
  * Keyed by GitHub's repo id, never its name: names get renamed and reused,
  * and a new repo must not land on an old one's backup.

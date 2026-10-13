@@ -1,11 +1,20 @@
 // Mirrors a source git repo into a backup remote without ever losing history.
+// Refs that were force-pushed or deleted upstream are preserved under
+// refs/backup/ before the live refs are updated.
 //
-// The backup remote is fetched first, so anything it already holds stays
-// reachable. Refs that were force-pushed or deleted upstream are preserved
-// under refs/backup/ before the live refs are updated.
+// There are two ways to do it:
+//
+//   incremental  asks the source for only the objects the backup lacks and
+//                hands exactly those over. Nothing is downloaded twice.
+//   full         downloads the existing backup, fetches the source on top
+//                and pushes the result. Used for a first sync, for repos
+//                too large for the target, and whenever the incremental
+//                path cannot finish.
 
 import { spawn } from "node:child_process";
+import { createReadStream } from "node:fs";
 import { mkdir, rm, stat, writeFile } from "node:fs/promises";
+import { advertisedRefs, fetchPack, pushCommands, ZERO } from "./relay.mjs";
 import { join } from "node:path";
 import { createInterface } from "node:readline";
 
@@ -32,13 +41,14 @@ function authEnv(authHeader) {
 	};
 }
 
-function git(cwd, args, { authHeader, input, allowFail = false, onLine } = {}) {
+function git(cwd, args, { authHeader, input, inputFile, allowFail = false, onLine } = {}) {
 	return new Promise((resolve, reject) => {
 		const child = spawn("git", args, {
 			cwd,
 			env: { ...process.env, GIT_TERMINAL_PROMPT: "0", ...authEnv(authHeader) },
-			stdio: [input === undefined ? "ignore" : "pipe", "pipe", "pipe"],
+			stdio: [input === undefined && !inputFile ? "ignore" : "pipe", "pipe", "pipe"],
 		});
+		if (inputFile) createReadStream(inputFile).pipe(child.stdin);
 		let stdout = "";
 		let stderr = "";
 		if (onLine) {
@@ -96,7 +106,190 @@ const stamp = (date) => date.toISOString().replace(/[-:]|\.\d+/g, "");
  *   large for the target to hold. It stands in for the target as the source
  *   of existing history, so rewritten and deleted refs are still kept.
  */
-export async function syncRepo(job, { workdir, onPhase = () => {}, now = new Date(), seedBundle }) {
+export async function syncRepo(job, opts) {
+	const overHttp = /^https?:\/\//.test(job.source.url) && /^https?:\/\//.test(job.target.url);
+	let fallback;
+	if (overHttp && !opts.seedBundle && job.incremental !== false) {
+		try {
+			const result = await syncIncremental(job, opts);
+			if (result) return result;
+		} catch (err) {
+			// A missing or unreachable source is a real answer, not a reason to retry differently.
+			if (err instanceof SyncError && err.code !== "GIT_FAILED") throw err;
+			fallback = String(err.message ?? err);
+			opts.onPhase?.("falling back to a full sync");
+		}
+	}
+	return { ...(await syncFull(job, opts)), mode: "full", ...(fallback ? { fallback } : {}) };
+}
+
+/** Snapshot bookkeeping shared by both paths: one snapshot per (ref, commit), ever. */
+function snapshotPlanner(before, ts) {
+	const taken = new Set();
+	for (const [ref, sha] of before) {
+		const kept = /^refs\/backup\/[^/]+\/[^/]+\/(.+)$/.exec(ref);
+		if (kept) taken.add(`${kept[1]} ${sha}`);
+	}
+	return (kind, ref, sha) => {
+		const rest = ref.slice("refs/".length);
+		if (taken.has(`${rest} ${sha}`)) return null;
+		taken.add(`${rest} ${sha}`);
+		return `${SNAPSHOT_PREFIX}${kind}/${ts}/${rest}`;
+	};
+}
+
+const refCounts = (refs) => {
+	const count = (prefix) => [...refs.keys()].filter((r) => r.startsWith(prefix)).length;
+	return { heads: count("refs/heads/"), tags: count("refs/tags/"), pulls: count("refs/pull/"), snapshots: count(SNAPSHOT_PREFIX) };
+};
+
+/**
+ * Whether `old` is an ancestor of `tip`, judged from the commits in a pack
+ * that holds everything new. "yes" is certain. "unknown" means the walk left
+ * the pack without meeting `old`, which a pack alone cannot settle.
+ */
+async function descendsFrom(scratchDir, commits, tip, old) {
+	if (tip === old) return "yes";
+	const parents = new Map();
+	if (commits.length) {
+		const bodies = await catBlobs(scratchDir, commits);
+		commits.forEach((sha, i) => parents.set(sha, [...(bodies[i] ?? "").split("\n\n")[0].matchAll(/^parent ([0-9a-f]{40})$/gm)].map((m) => m[1])));
+	}
+	const seen = new Set();
+	const queue = [tip];
+	while (queue.length) {
+		const sha = queue.pop();
+		if (sha === old) return "yes";
+		if (seen.has(sha)) continue;
+		seen.add(sha);
+		for (const parent of parents.get(sha) ?? []) queue.push(parent);
+	}
+	return "unknown";
+}
+
+/**
+ * Syncs by moving only new objects. Returns null when this path does not
+ * apply (an empty backup, or content the target cannot hold), in which case
+ * the caller does a full sync.
+ */
+async function syncIncremental(job, { workdir, onPhase = () => {}, now = new Date() }) {
+	const { source, target } = job;
+	const ts = stamp(now);
+
+	onPhase("reading the backup's refs");
+	const { refs: before, capabilities } = await advertisedRefs(target.url, target.authHeader);
+	if (before.size === 0) return null;
+
+	await rm(workdir, { recursive: true, force: true });
+	const scratch = join(workdir, "new.git");
+	await mkdir(scratch, { recursive: true });
+	await git(scratch, ["init", "--bare", "--quiet"]);
+
+	onPhase("listing source refs");
+	const patterns = ["refs/heads/*", "refs/tags/*"];
+	if (source.pulls) patterns.push("refs/pull/*/head");
+	const upstream = await lsRemote(scratch, source.url, source.authHeader, patterns);
+
+	const changed = [...upstream].filter(([ref, sha]) => before.get(ref) !== sha);
+	const deleted = [...before].filter(([ref]) => isLive(ref) && !upstream.has(ref));
+
+	// Fetch what the backup does not have. Everything it holds is offered as
+	// a "have", so the source sends only what is genuinely new.
+	const held = new Set(before.values());
+	const wants = [...new Set(changed.map(([, sha]) => sha).filter((sha) => !held.has(sha)))];
+	const packPath = join(workdir, "new.pack");
+	let packBytes = 0;
+	let scan = { largestBlob: 0, lfs: [], commits: [] };
+	if (wants.length) {
+		onPhase("fetching new objects from source");
+		packBytes = await fetchPack(source.url, source.authHeader, wants, [...held], packPath);
+		// index-pack verifies every object's checksum before anything is passed on.
+		await git(scratch, ["index-pack", "--stdin"], { inputFile: packPath });
+		onPhase("scanning new objects");
+		scan = await scanObjects(scratch, job.limits?.maxBlobBytes ?? Infinity, job.lfs !== false);
+	}
+	const sizeBytes = (job.knownSizeBytes ?? 0) + packBytes;
+	if (scan.largestBlob > (job.limits?.maxBlobBytes ?? Infinity) || sizeBytes > (job.limits?.maxRepoBytes ?? Infinity)) return null;
+
+	// Work out which changes dropped history, before anything is overwritten.
+	const snapshotName = snapshotPlanner(before, ts);
+	const snapshots = [];
+	const keep = (kind, ref, sha) => {
+		const name = snapshotName(kind, ref, sha);
+		if (name) snapshots.push({ ref: name, old: ZERO, new: sha });
+	};
+	for (const [ref, sha] of deleted) keep("deleted", ref, sha);
+	for (const [ref, newSha] of changed) {
+		const oldSha = before.get(ref);
+		if (!oldSha) continue;
+		// A moved tag is always a rewrite; a branch only if history was dropped.
+		let fastForward = false;
+		if (!ref.startsWith("refs/tags/")) {
+			fastForward = (await descendsFrom(scratch, scan.commits, newSha, oldSha)) === "yes";
+			if (!fastForward && source.api) fastForward = await aheadOnSource(source, oldSha, newSha);
+		}
+		// When it cannot be settled, keep the old commit: an extra snapshot costs nothing.
+		if (!fastForward) keep("rewritten", ref, oldSha);
+	}
+
+	// Snapshots and deletions first, so kept history is safe before anything
+	// moves and a reused name (`foo` -> `foo/bar`) finds its path clear.
+	onPhase("pushing to backup");
+	let deleteFailures = 0;
+	const removals = capabilities.has("delete-refs") ? deleted.map(([ref, sha]) => ({ ref, old: sha, new: ZERO })) : [];
+	if (!capabilities.has("delete-refs")) deleteFailures = deleted.length;
+	if (snapshots.length || removals.length) {
+		const outcome = await pushCommands(target.url, target.authHeader, [...snapshots, ...removals]);
+		for (const s of snapshots) if (outcome.get(s.ref)) throw new SyncError("GIT_FAILED", `could not keep ${s.ref}: ${outcome.get(s.ref)}`);
+		for (const r of removals) if (outcome.get(r.ref)) deleteFailures++;
+	}
+	if (changed.length) {
+		const updates = changed.map(([ref, sha]) => ({ ref, old: before.get(ref) ?? ZERO, new: sha }));
+		const outcome = await pushCommands(target.url, target.authHeader, updates, wants.length ? packPath : null);
+		const refused = updates.filter((u) => outcome.get(u.ref));
+		if (refused.length) throw new SyncError("GIT_FAILED", `the backup refused ${refused.length} ref(s), first ${refused[0].ref}: ${outcome.get(refused[0].ref)}`);
+	}
+
+	const after = new Map(before);
+	for (const s of snapshots) after.set(s.ref, s.new);
+	for (const [ref] of deleted) after.delete(ref);
+	for (const [ref, sha] of changed) after.set(ref, sha);
+
+	const lfsPath = join(workdir, "lfs.json");
+	await writeFile(lfsPath, JSON.stringify(scan.lfs));
+	await rm(scratch, { recursive: true, force: true });
+	await rm(packPath, { force: true });
+	return {
+		mode: "incremental",
+		transferredBytes: packBytes,
+		refs: refCounts(after),
+		updated: changed.length,
+		deleted: deleted.length,
+		deleteFailures,
+		newSnapshots: snapshots.map((s) => s.ref),
+		sizeBytes,
+		oversize: null,
+		bundle: null,
+		// Only pointers in the new objects; the caller adds them to what it knows.
+		lfs: { path: lfsPath, size: (await stat(lfsPath)).size, count: scan.lfs.length, bytes: scan.lfs.reduce((n, o) => n + o.size, 0), incremental: true },
+	};
+}
+
+/** Asks the source's API whether `tip` only adds to `old`. Any doubt counts as "no". */
+async function aheadOnSource(source, old, tip) {
+	try {
+		const res = await fetch(`${source.api}/compare/${old}...${tip}`, {
+			headers: { "User-Agent": "gh-backup", Accept: "application/vnd.github+json", ...(source.authHeader ? { Authorization: source.authHeader } : {}) },
+		});
+		if (!res.ok) return false;
+		const status = (await res.json()).status;
+		return status === "ahead" || status === "identical";
+	} catch {
+		return false;
+	}
+}
+
+async function syncFull(job, { workdir, onPhase = () => {}, now = new Date(), seedBundle }) {
 	const repoDir = join(workdir, "repo.git");
 	await rm(workdir, { recursive: true, force: true });
 	await mkdir(repoDir, { recursive: true });
@@ -117,20 +310,12 @@ export async function syncRepo(job, { workdir, onPhase = () => {}, now = new Dat
 	if (source.pulls) patterns.push("refs/pull/*/head");
 	const upstream = await lsRemote(repoDir, source.url, source.authHeader, patterns);
 
-	// A snapshot is identified by the ref it preserves and the commit it
-	// pointed at, so two refs at one commit each keep their own name.
-	const snapshotted = new Set();
-	for (const [ref, sha] of before) {
-		const kept = /^refs\/backup\/[^/]+\/[^/]+\/(.+)$/.exec(ref);
-		if (kept) snapshotted.add(`${kept[1]} ${sha}`);
-	}
+	const snapshotName = snapshotPlanner(before, ts);
 	const snapshots = [];
 	const snapshot = async (kind, ref, sha) => {
-		const rest = ref.slice("refs/".length);
-		if (snapshotted.has(`${rest} ${sha}`)) return;
-		const name = `${SNAPSHOT_PREFIX}${kind}/${ts}/${rest}`;
+		const name = snapshotName(kind, ref, sha);
+		if (!name) return;
 		await git(repoDir, ["update-ref", name, sha]);
-		snapshotted.add(`${rest} ${sha}`);
 		snapshots.push({ kind, ref, sha, name });
 	};
 
@@ -209,14 +394,8 @@ export async function syncRepo(job, { workdir, onPhase = () => {}, now = new Dat
 		await git(repoDir, ["push", "--quiet", target.url, "+refs/*:refs/*"], { authHeader: target.authHeader });
 	}
 
-	const count = (prefix) => [...after.keys()].filter((r) => r.startsWith(prefix)).length;
 	return {
-		refs: {
-			heads: count("refs/heads/"),
-			tags: count("refs/tags/"),
-			pulls: count("refs/pull/"),
-			snapshots: count(SNAPSHOT_PREFIX),
-		},
+		refs: refCounts(after),
 		updated,
 		deleted: deleted.length,
 		deleteFailures,
@@ -232,8 +411,10 @@ export async function syncRepo(job, { workdir, onPhase = () => {}, now = new Dat
 async function scanObjects(repoDir, maxBlobBytes, wantLfs) {
 	let largestBlob = 0;
 	const candidates = [];
+	const commits = [];
 	await git(repoDir, ["cat-file", "--batch-all-objects", "--unordered", "--batch-check=%(objecttype) %(objectsize) %(objectname)"], {
 		onLine: (line) => {
+			if (line.startsWith("commit ")) commits.push(line.split(" ")[2]);
 			if (!line.startsWith("blob ")) return;
 			const [, size, sha] = line.split(" ");
 			const n = Number(size);
@@ -250,7 +431,7 @@ async function scanObjects(repoDir, maxBlobBytes, wantLfs) {
 			if (m) lfs.set(m[1], { oid: m[1], size: Number(m[2]) });
 		}
 	}
-	return { largestBlob, lfs: [...lfs.values()] };
+	return { largestBlob, lfs: [...lfs.values()], commits };
 }
 
 function catBlobs(repoDir, shas) {

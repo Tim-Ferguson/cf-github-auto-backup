@@ -4,7 +4,7 @@ import { ensureSchema, getAccount, getRepo, isBackedUp, type Repo, STARRED, upda
 import { gitBasicAuth, loadDeployment, tokenFor } from "./github.ts";
 import { META_VERSION, type PageResult, regroupFlatComments, RESOURCES, syncMetadataPage } from "./metadata.ts";
 import { type GitRunner, runnerFor } from "./runner.ts";
-import { copyLfsObjects, latestBundle, type LfsObject, lfsManifestKey, metaPrefix, pruneBundles, putRanged, putStream } from "./storage.ts";
+import { copyLfsObjects, latestBundle, type LfsObject, lfsManifestKey, lfsPendingKey, metaPrefix, pruneBundles, putRanged } from "./storage.ts";
 
 export interface BackupParams {
 	repoId: number;
@@ -39,7 +39,13 @@ interface GitResult {
 	sizeBytes: number;
 	oversize: string | null;
 	bundle: { size: number } | null;
-	lfs: { count: number; bytes: number; size: number };
+	/** With `incremental`, only the pointers found in newly fetched objects. */
+	lfs: { count: number; bytes: number; size: number; incremental?: boolean };
+	/** "incremental" moved only new objects; "full" downloaded the backup first. */
+	mode?: "incremental" | "full";
+	transferredBytes?: number;
+	/** Why an incremental sync was abandoned for a full one. */
+	fallback?: string;
 }
 
 interface RunnerStatus {
@@ -62,6 +68,10 @@ interface GitJob {
 	optional: boolean;
 	/** R2 key of a bundle that holds the existing backup, for repos too large for Artifacts. */
 	seedBundle: string | null;
+	/** GitHub API base for this repo, used to tell a fast-forward from a rewrite. */
+	api: string | null;
+	/** Size of the backup so far, so growth past the target's limit is noticed. */
+	knownSizeBytes: number;
 }
 
 /**
@@ -114,6 +124,7 @@ export class BackupWorkflow extends WorkflowEntrypoint<Env, BackupParams> {
 				starred: repo.account === STARRED,
 				pushedAt: repo.pushed_at,
 				bundled: repo.storage === "r2-bundle",
+				sizeBytes: repo.size_bytes ?? 0,
 				// An older metadata layout gets one full resync instead of an incremental one.
 				metaCursor: repo.meta_version < META_VERSION ? null : repo.meta_cursor,
 				previousCursor: repo.meta_cursor,
@@ -154,6 +165,8 @@ export class BackupWorkflow extends WorkflowEntrypoint<Env, BackupParams> {
 					pulls: true,
 					optional: false,
 					seedBundle,
+					api: plan.starred ? null : `https://api.github.com/repos/${plan.fullName}`,
+					knownSizeBytes: plan.sizeBytes,
 				});
 				if (!git) throw new NonRetryableError("git sync returned no result");
 				detail.git = git;
@@ -180,16 +193,22 @@ export class BackupWorkflow extends WorkflowEntrypoint<Env, BackupParams> {
 						storage: result.oversize ? "r2-bundle" : "artifacts",
 						size_bytes: result.sizeBytes,
 						ref_counts: JSON.stringify(result.refs),
-						lfs_count: result.lfs.count,
-						lfs_bytes: result.lfs.bytes,
+						// A full sync saw every object, so its LFS count is the total.
+						...(result.lfs.incremental ? {} : { lfs_count: result.lfs.count, lfs_bytes: result.lfs.bytes }),
 					});
 				});
 
 				if (result.lfs.count > 0) {
 					await step.do("lfs: manifest", async () => {
 						const res = await runner().fetch("http://runner/lfs.json");
-						if (!res.ok || !res.body) throw new Error(`LFS manifest download failed: ${res.status}`);
-						await putStream(env.BUCKET, lfsManifestKey(repoId), res.body, result.lfs.size);
+						if (!res.ok) throw new Error(`LFS manifest download failed: ${res.status}`);
+						const found = await res.json<LfsObject[]>();
+						// An incremental sync reports only new pointers; add them to the known ones.
+						const known = result.lfs.incremental ? ((await (await env.BUCKET.get(lfsManifestKey(repoId)))?.json<LfsObject[]>()) ?? []) : [];
+						const all = [...new Map([...known, ...found].map((o) => [o.oid, o])).values()];
+						await env.BUCKET.put(lfsManifestKey(repoId), JSON.stringify(all));
+						await env.BUCKET.put(lfsPendingKey(repoId), JSON.stringify(found));
+						await updateRepo(env.DB, repoId, { lfs_count: all.length, lfs_bytes: all.reduce((n, o) => n + o.size, 0) });
 					});
 				}
 			}
@@ -207,6 +226,8 @@ export class BackupWorkflow extends WorkflowEntrypoint<Env, BackupParams> {
 					pulls: false,
 					optional: true,
 					seedBundle: null,
+					api: null,
+					knownSizeBytes: 0,
 				});
 				if (wiki?.oversize) throw new NonRetryableError(`the wiki is too large for Artifacts and was not backed up: ${wiki.oversize}`);
 				if (wiki) detail.wiki = { refs: wiki.refs, sizeBytes: wiki.sizeBytes, newSnapshots: wiki.newSnapshots };
@@ -221,7 +242,7 @@ export class BackupWorkflow extends WorkflowEntrypoint<Env, BackupParams> {
 				let missing = 0;
 				for (let offset = 0; offset < git.lfs.count; offset += LFS_BATCH) {
 					const res = await step.do(`lfs: copy ${offset}`, { timeout: "2 hours", retries: { limit: 3, delay: "1 minute", backoff: "exponential" } }, async () => {
-						const manifest = await env.BUCKET.get(lfsManifestKey(repoId));
+						const manifest = await env.BUCKET.get(lfsPendingKey(repoId));
 						if (!manifest) throw new NonRetryableError("LFS manifest is missing");
 						const objects = (await manifest.json<LfsObject[]>()).slice(offset, offset + LFS_BATCH);
 						const out = await copyLfsObjects(env.BUCKET, plan.fullName, await sourceToken(), objects);
@@ -366,7 +387,8 @@ export class BackupWorkflow extends WorkflowEntrypoint<Env, BackupParams> {
 				headers: { "content-type": "application/json" },
 				body: JSON.stringify({
 					id: job.jobId,
-					source: { url: sourceUrl, authHeader, pulls: job.pulls },
+					source: { url: sourceUrl, authHeader, pulls: job.pulls, ...(job.api ? { api: job.api } : {}) },
+					knownSizeBytes: job.knownSizeBytes,
 					target: { url: remote, authHeader: `Bearer ${targetToken}` },
 					limits: { maxBlobBytes: MAX_BLOB_BYTES, maxRepoBytes: MAX_REPO_BYTES },
 					seeded: !!job.seedBundle,

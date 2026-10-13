@@ -164,7 +164,7 @@ dashboard ────────┘                      │
 - **Code browser** (`src/code.ts`, `src/markdown.ts`): reads trees, files and commits through the Artifacts binding. Repository content is treated as untrusted: Markdown HTML is rebuilt from an allowlist, the pages allow no inline script or forms, and raw files are served sandboxed.
 - **CLI** (`cli/gh-backup.mjs`): setup wizard and control panel. Plain Node, no dependencies.
 - **Workflow** (`src/workflow.ts`): one durable, retried run per repository. Skips the git step when nothing was pushed since the last sync.
-- **Container** (`container/`): Alpine, git and about 300 lines of Node. It fetches the existing backup from Artifacts, fetches from GitHub on top, snapshots anything that was rewritten or deleted, and pushes the result. Credentials are passed through the environment, never the command line.
+- **Container** (`container/`): Alpine, git and a few hundred lines of Node. A sync is *incremental*: it compares the refs on both sides, asks GitHub for only the objects the backup lacks, and hands exactly those to Artifacts along with the ref updates, keeping anything that was rewritten or deleted. A push of one commit moves one commit's worth of data, however large the repository. A *full* sync, which downloads the existing backup first, is used for the first sync, for repos too large for Artifacts, and automatically whenever the incremental path cannot finish. Credentials are passed through the environment, never the command line.
 - **D1**: settings, the repo list and run history. **R2**: everything that is not git.
 
 Syncs run on every push (bursts collapse into one per two minutes), every 6 hours for anything that changed, and at least daily for metadata. Change the schedule in `cloudflare.config.ts`.
@@ -256,6 +256,7 @@ One real run, on one personal account, set up with the CLI and a GitHub App:
 - **Every ref verified**: all 100 branches and 55 pull request heads (`refs/pull/*`) in Artifacts were compared with GitHub and matched.
 - **Restore**: a repository cloned back from Cloudflare with the dashboard's clone command was complete and matched GitHub.
 - **Metadata**: issues, pull requests, comments and labels were written to R2.
+- **Incremental sync**: against real GitHub and a scratch Artifacts repo, a hand-built partial fetch and push produced a backup that matched GitHub and passed `git fsck`. That run also confirmed Artifacts accepts `refs/backup/*` and `refs/pull/*`, non-fast-forward updates and ref deletions, and refuses an update whose expected old value is stale.
 - **A code review's fixes** (see the commit history): the live deployment was migrated in place with all 60 repositories still on, none marked gone, and syncs succeeding afterwards. The rate limiter held against 50 simultaneous guesses in a local test. The bundle-seeding fix is covered by a local test only.
 - **Theme toggle, per-repository switches and auto-import settings**: checked in headless Chrome against the live deployment.
 - **Changing the address**: `move` redeployed a live instance under a new name with all 60 backups intact, removed the old Worker, re-pointed the GitHub webhook, and a full sync then succeeded on the new one.
