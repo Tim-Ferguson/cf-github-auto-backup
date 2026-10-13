@@ -348,13 +348,13 @@ async function handleApp(request: Request, env: Env, ctx: ExecutionContext, url:
 		return redirect("/");
 	}
 
-	const repoMatch = /^\/repos\/(\d+)(?:\/(override|sync|token|code|blob|raw|commits))?$/.exec(path);
+	const repoMatch = /^\/repos\/(\d+)(?:\/(override|sync|token|code|blob|raw|commits|tree))?$/.exec(path);
 	if (repoMatch) {
 		const id = Number(repoMatch[1]);
 		const action = repoMatch[2];
 		const repo = await getRepo(env.DB, id);
 		if (!repo) return messagePage("Not found", "No such repository.", 404, { href: "/", label: "Back" });
-		if (action === "code" || action === "blob" || action === "raw" || action === "commits") {
+		if (action === "code" || action === "blob" || action === "raw" || action === "commits" || action === "tree") {
 			return post ? redirect(`/repos/${id}/code`) : handleCode(env, url, repo, action);
 		}
 
@@ -388,6 +388,7 @@ export default {
 		const url = new URL(request.url);
 		const path = url.pathname;
 		if (path === "/healthz") return new Response("ok");
+		if (path === "/favicon.ico") return new Response(null, { status: 204, headers: { "cache-control": "public, max-age=86400" } });
 		const asset = path.startsWith("/assets/") ? serveAsset(path) : null;
 		if (asset) return asset;
 		try {

@@ -12,7 +12,7 @@ import type { Repo } from "./db.ts";
 import { type LinkContext, renderMarkdown } from "./markdown.ts";
 import { ago, bytes, html, messagePage, page, raw } from "./ui.ts";
 
-const CODE_CSP = "default-src 'none'; style-src 'unsafe-inline' 'self'; script-src 'self'; img-src 'self' https: data:; form-action 'none'; base-uri 'none'; frame-ancestors 'none'";
+const CODE_CSP = "default-src 'none'; style-src 'unsafe-inline' 'self'; script-src 'self'; connect-src 'self'; img-src 'self' https: data:; form-action 'none'; base-uri 'none'; frame-ancestors 'none'";
 const RAW_CSP = "sandbox; default-src 'none'; style-src 'unsafe-inline'; img-src data:";
 
 const MAX_VIEW_BYTES = 1024 * 1024;
@@ -23,16 +23,109 @@ const COMMITS_PER_PAGE = 30;
 const REFS_CACHE_SECONDS = 60;
 
 const CLIENT_JS = `
-document.querySelectorAll("pre code").forEach(function (el) {
-	if (el.hasAttribute("data-plain")) return;
-	var lang = (el.className.match(/language-([\\w+#-]+)/) || [])[1];
-	if (lang && !hljs.getLanguage(lang)) el.className = "";
-	if (!lang && !el.hasAttribute("data-auto")) return;
-	hljs.highlightElement(el);
-});
-document.querySelectorAll("select[data-nav]").forEach(function (el) {
-	el.addEventListener("change", function () { location.href = el.value; });
-});
+(function () {
+	var pane = document.getElementById("pane");
+	var tree = document.getElementById("tree");
+
+	function highlight(root) {
+		root.querySelectorAll("pre code").forEach(function (el) {
+			if (el.hasAttribute("data-plain") || el.dataset.highlighted) return;
+			var lang = (el.className.match(/language-([\\w+#-]+)/) || [])[1];
+			if (lang && !hljs.getLanguage(lang)) el.className = "";
+			if (!lang && !el.hasAttribute("data-auto")) return;
+			hljs.highlightElement(el);
+		});
+	}
+	highlight(document);
+
+	document.addEventListener("change", function (e) {
+		if (e.target.matches && e.target.matches("select[data-nav]")) location.href = e.target.value;
+	});
+	if (!pane || !tree) return;
+
+	function here() { return location.pathname + location.search; }
+	function linkFor(target) {
+		var found = null;
+		tree.querySelectorAll("a").forEach(function (a) { if (a.getAttribute("href") === target) found = a; });
+		return found;
+	}
+	function mark() {
+		// On a first load the server has already marked the current entry.
+		var a = linkFor(here()) || tree.querySelector("[aria-current]");
+		tree.querySelectorAll("[aria-current]").forEach(function (el) { el.removeAttribute("aria-current"); });
+		if (a) { a.setAttribute("aria-current", "page"); if (a.scrollIntoView) a.scrollIntoView({ block: "nearest" }); }
+	}
+
+	// Swap the right-hand pane for the one in the fetched page.
+	function load(href, push) {
+		pane.classList.add("loading");
+		return fetch(href, { credentials: "same-origin" })
+			.then(function (res) { return res.text(); })
+			.then(function (text) {
+				var doc = new DOMParser().parseFromString(text, "text/html");
+				var next = doc.getElementById("pane");
+				if (!next) { location.href = href; return; }
+				pane.innerHTML = next.innerHTML;
+				document.title = doc.title;
+				if (push) history.pushState({}, "", href);
+				// Keep the tree in step: open the folder just entered, or take the
+				// server's tree when the jump went somewhere not opened yet.
+				var nextTree = doc.getElementById("tree");
+				var target = linkFor(here());
+				if (!target && nextTree) tree.innerHTML = nextTree.innerHTML;
+				else if (target && target.dataset.tree && target.getAttribute("aria-expanded") !== "true") toggle(target);
+				highlight(pane);
+				mark();
+				pane.classList.remove("loading");
+				window.scrollTo(0, 0);
+			})
+			.catch(function () { location.href = href; });
+	}
+
+	function toggle(a) {
+		var li = a.parentNode;
+		var list = li.querySelector(":scope > ul");
+		if (list) {
+			var open = list.hidden;
+			list.hidden = !open;
+			a.setAttribute("aria-expanded", String(open));
+			return Promise.resolve(open);
+		}
+		a.setAttribute("aria-busy", "true");
+		return fetch(a.dataset.tree, { credentials: "same-origin" })
+			.then(function (res) { return res.ok ? res.text() : ""; })
+			.then(function (markup) {
+				a.removeAttribute("aria-busy");
+				if (!markup) return false;
+				li.insertAdjacentHTML("beforeend", markup);
+				a.setAttribute("aria-expanded", "true");
+				return true;
+			})
+			.catch(function () { location.href = a.getAttribute("href"); return false; });
+	}
+
+	function plainClick(e) { return !(e.metaKey || e.ctrlKey || e.shiftKey || e.altKey || e.button); }
+
+	tree.addEventListener("click", function (e) {
+		var a = e.target.closest("a");
+		if (!a || !plainClick(e)) return;
+		e.preventDefault();
+		if (a.dataset.tree) {
+			// Opening a folder also shows it; closing one only folds it away.
+			toggle(a).then(function (opened) { if (opened) load(a.getAttribute("href"), true); });
+		} else {
+			load(a.getAttribute("href"), true);
+		}
+	});
+	pane.addEventListener("click", function (e) {
+		var a = e.target.closest("a[data-pane]");
+		if (!a || !plainClick(e)) return;
+		e.preventDefault();
+		load(a.getAttribute("href"), true);
+	});
+	window.addEventListener("popstate", function () { load(here(), false); });
+	mark();
+})();
 `;
 
 const CODE_CSS = `
@@ -43,7 +136,7 @@ const CODE_CSS = `
 .codebox { display:flex; border:1px solid var(--line); border-radius:8px; overflow:hidden; background:var(--card); }
 .codebox pre { margin:0; border-radius:0; background:transparent; padding:12px; line-height:1.5; font-size:12px; }
 .codebox pre.ln { text-align:right; color:var(--muted); user-select:none; border-right:1px solid var(--line); flex:none; }
-.codebox pre.src { flex:1; overflow-x:auto; } .codebox code { font:inherit; padding:0; background:transparent; }
+.codebox pre.src { flex:1; overflow-x:auto; tab-size:4; } .codebox code { font:inherit; padding:0; background:transparent; }
 .preview { text-align:center; padding:16px; } .preview img { max-width:100%; }
 .md { line-height:1.6; overflow-wrap:anywhere; } .md img { max-width:100%; }
 .md h1, .md h2 { border-bottom:1px solid var(--line); padding-bottom:6px; margin:24px 0 12px; font-size:22px; } .md h2 { font-size:18px; } .md h3 { font-size:15px; }
@@ -51,9 +144,31 @@ const CODE_CSS = `
 .md blockquote { margin:0; padding-left:14px; border-left:3px solid var(--line); color:var(--muted); }
 .md table { width:auto; } .md th, .md td { border:1px solid var(--line); white-space:normal; }
 .commit-msg { white-space:normal; }
+main:has(.browser) { max-width:1560px; }
+.browser { display:grid; grid-template-columns:290px minmax(0,1fr); gap:16px; align-items:start; }
+.side { position:sticky; top:12px; max-height:calc(100vh - 24px); overflow:auto; background:var(--card); border:1px solid var(--line); border-radius:10px; padding:10px 8px; font-size:13px; }
+.side summary { display:none; }
+.side ul { list-style:none; margin:0; padding:0; } .side ul ul { padding-left:14px; }
+.side li { margin:0; }
+.side a { display:block; padding:3px 8px; border-radius:6px; text-decoration:none; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.side a:hover { background:var(--chip); }
+.side a[aria-current] { background:var(--chip); font-weight:600; box-shadow:inset 2px 0 0 var(--accent); }
+.side a[data-tree]::before { content:"▸"; display:inline-block; width:14px; color:var(--muted); }
+.side a[data-tree][aria-expanded="true"]::before { content:"▾"; }
+.side a[aria-busy]::before { content:"…"; }
+.side a:not([data-tree]) { padding-left:22px; }
+.side .repo { font-weight:600; padding:2px 8px 8px; border-bottom:1px solid var(--line); margin-bottom:6px; }
+#pane { min-width:0; transition:opacity .12s; } #pane.loading { opacity:.45; }
+@media (max-width: 860px) {
+	.browser { grid-template-columns:minmax(0,1fr); }
+	.side { position:static; max-height:none; }
+	.side summary { display:block; cursor:pointer; padding:2px 8px; font-weight:600; }
+	.side:not([open]) > :not(summary) { display:none; }
+}
 ${lightTheme}
 @media (prefers-color-scheme: dark) { ${darkTheme} }
 .hljs { background:transparent; }
+pre code.hljs { padding:0; overflow-x:visible; }
 `;
 
 const HEAD = raw(`<link rel="stylesheet" href="/assets/code.css"><script src="/assets/highlight.js" defer></script><script src="/assets/code.js" defer></script>`);
@@ -139,27 +254,34 @@ function refLabel(name: string): string {
 }
 
 type Entry = ArtifactsTreeEntry;
-type Found = { kind: "tree"; entries: Entry[] } | { kind: "blob"; entry: Entry } | null;
+/** `trail[i]` lists the directory `i` levels down the requested path, root first. */
+type Found = { kind: "tree"; entries: Entry[]; trail: Entry[][] } | { kind: "blob"; entry: Entry; trail: Entry[][] } | { kind: "missing"; trail: Entry[][] };
 
-async function walk(handle: ArtifactsRepo, treeHash: string, path: string): Promise<Found> {
+async function walk(handle: ArtifactsRepo, treeHash: string, path: string): Promise<Found | null> {
 	let entries = await handle.readTree(treeHash);
 	if (!entries) return null;
+	const trail = [entries];
 	const parts = path.split("/").filter(Boolean);
 	for (let i = 0; i < parts.length; i++) {
 		const entry: Entry | undefined = entries.find((e) => e.name === parts[i]);
-		if (!entry) return null;
-		if (entry.type !== "tree") return i === parts.length - 1 ? { kind: "blob", entry } : null;
+		if (!entry) return { kind: "missing", trail };
+		if (entry.type !== "tree") return i === parts.length - 1 ? { kind: "blob", entry, trail } : { kind: "missing", trail };
 		entries = await handle.readTree(entry.hash);
-		if (!entries) return null;
+		if (!entries) return { kind: "missing", trail };
+		trail.push(entries);
 	}
-	return { kind: "tree", entries };
+	return { kind: "tree", entries, trail };
 }
+
+const sortEntries = (entries: Entry[]) => [...entries].sort((a, b) => Number(b.type === "tree") - Number(a.type === "tree") || a.name.localeCompare(b.name));
 
 function looksBinary(bytes: Uint8Array): boolean {
 	return bytes.subarray(0, 8000).includes(0);
 }
 
-export async function handleCode(env: Env, url: URL, repo: Repo, view: "code" | "blob" | "raw" | "commits"): Promise<Response> {
+export type CodeView = "code" | "blob" | "raw" | "commits" | "tree";
+
+export async function handleCode(env: Env, url: URL, repo: Repo, view: CodeView): Promise<Response> {
 	const back = { href: `/repos/${repo.id}`, label: "Back" };
 	if (repo.storage !== "artifacts" || !repo.artifacts_name) {
 		return messagePage("Nothing to browse", repo.storage === "r2-bundle" ? "This repository is stored as a git bundle in R2, which cannot be browsed here. Download the bundle to look inside." : "This repository has not been backed up yet.", 404, back);
@@ -178,7 +300,7 @@ export async function handleCode(env: Env, url: URL, repo: Repo, view: "code" | 
 	}
 }
 
-async function render(handle: ArtifactsRepo, url: URL, repo: Repo, view: "code" | "blob" | "raw" | "commits"): Promise<Response> {
+async function render(handle: ArtifactsRepo, url: URL, repo: Repo, view: CodeView): Promise<Response> {
 	const base = `/repos/${repo.id}`;
 	const back = { href: base, label: "Back" };
 	const refs = await listRefs(handle, repo.artifacts_name!);
@@ -215,15 +337,44 @@ async function render(handle: ArtifactsRepo, url: URL, repo: Repo, view: "code" 
 </select>`;
 
 	const parts = path ? path.split("/") : [];
-	const crumbs = html`<span class="crumbs"><a href="${link("code")}"><b>${repo.full_name.split("/")[1]}</b></a>${parts.map(
-		(part, i) => html` / ${i === parts.length - 1 ? part : html`<a href="${link("code", parts.slice(0, i + 1).join("/"))}">${part}</a>`}`,
+	const crumbs = html`<span class="crumbs"><a data-pane href="${link("code")}"><b>${repo.full_name.split("/")[1]}</b></a>${parts.map(
+		(part, i) => html` / ${i === parts.length - 1 ? part : html`<a data-pane href="${link("code", parts.slice(0, i + 1).join("/"))}">${part}</a>`}`,
 	)}</span>`;
 	const header = (title: string, extra: unknown = "") => html`
 <header class="top">
 	<div><a class="link small" href="${base}">← ${repo.full_name}</a><h1>${title}</h1></div>
 	<div class="row">${picker}<a class="btn" href="${link("code")}">Files</a><a class="btn" href="${link("commits")}">History</a>${extra}</div>
 </header>`;
-	const show = (title: string, body: unknown, status = 200) => page(`${title} · ${repo.full_name}`, html`${body}`, { csp: CODE_CSP, head: HEAD, status });
+
+	const found = await walk(handle, commit.treeHash, view === "commits" ? "" : path);
+	if (!found) return messagePage("Not found", "That commit's files are not in this backup.", 404, back);
+
+	/** One level of the sidebar tree; `trail` opens the folders leading to the current path. */
+	const treeList = (entries: Entry[], dir: string, depth: number): unknown => html`<ul>${sortEntries(entries).map((e) => {
+		const full = dir ? `${dir}/${e.name}` : e.name;
+		if (e.type === "gitlink") return html`<li><a class="muted" title="submodule">${e.name}</a></li>`;
+		const here = full === path ? raw(`aria-current="page"`) : "";
+		if (e.type !== "tree") return html`<li><a href="${link("blob", full)}" title="${e.name}" ${here}>${e.name}</a></li>`;
+		const open = parts[depth] === e.name && parts.slice(0, depth).join("/") === dir && found.trail.length > depth + 1;
+		return html`<li><a href="${link("code", full)}" data-tree="${link("tree", full)}" aria-expanded="${open ? "true" : "false"}" title="${e.name}" ${here}>${e.name}</a>${open ? treeList(found.trail[depth + 1], full, depth + 1) : ""}</li>`;
+	})}</ul>`;
+
+	if (view === "tree") {
+		if (found.kind !== "tree") return new Response("", { status: 404 });
+		return new Response(String(treeList(found.entries, path, parts.length)), {
+			headers: { "content-type": "text/html; charset=utf-8", "cache-control": "private, no-store", "content-security-policy": CODE_CSP, "x-content-type-options": "nosniff" },
+		});
+	}
+
+	const show = (title: string, body: unknown, status = 200) =>
+		page(
+			`${title} · ${repo.full_name}`,
+			html`<div class="browser">
+<details class="side" open><summary>Files</summary><div class="repo"><a href="${link("code")}" title="${repo.full_name}">${repo.full_name.split("/")[1]}</a></div><nav id="tree" aria-label="Files">${treeList(found.trail[0], "", 0)}</nav></details>
+<div id="pane">${body}</div>
+</div>`,
+			{ csp: CODE_CSP, head: HEAD, status },
+		);
 
 	if (view === "commits") {
 		const pageNo = Math.max(0, Number(url.searchParams.get("page")) || 0);
@@ -243,14 +394,13 @@ ${commits.slice(0, COMMITS_PER_PAGE).map(
 		);
 	}
 
-	const found = await walk(handle, commit.treeHash, path);
-	if (!found) return show("Not found", html`${header("Not found")}<div class="card">${crumbs}<p>There is no <code>${path}</code> at ${refLabel(current.name)}.</p></div>`, 404);
+	if (found.kind === "missing") return show("Not found", html`${header("Not found")}<div class="card">${crumbs}<p>There is no <code>${path}</code> at ${refLabel(current.name)}.</p></div>`, 404);
 
 	const markdownContext = (dir: string): LinkContext => ({ dir, fileUrl: (p) => link("blob", p), rawUrl: (p) => link("raw", p) });
 
 	if (found.kind === "tree") {
 		if (view !== "code") return Response.redirect(new URL(link("code", path), url).toString(), 302);
-		const entries = [...found.entries].sort((a, b) => Number(b.type === "tree") - Number(a.type === "tree") || a.name.localeCompare(b.name));
+		const entries = sortEntries(found.entries);
 		const child = (name: string) => (path ? `${path}/${name}` : name);
 
 		let readme: unknown = "";
@@ -269,13 +419,13 @@ ${commits.slice(0, COMMITS_PER_PAGE).map(
 <div class="card">
 	<div class="bar">${crumbs}<span class="muted small"><a class="link" href="${link("commits")}"><code>${commit.hash.slice(0, 10)}</code></a> ${commit.message.split("\n")[0].slice(0, 90)} · ${commit.author.name} · ${ago(when)}</span></div>
 	<div class="scroll"><table class="files"><tbody>
-	${path ? html`<tr><td><a href="${link("code", parts.slice(0, -1).join("/"))}">..</a></td><td></td></tr>` : ""}
+	${path ? html`<tr><td><a data-pane href="${link("code", parts.slice(0, -1).join("/"))}">..</a></td><td></td></tr>` : ""}
 	${entries.map((e) =>
 		e.type === "tree"
-			? html`<tr><td>📁 <a href="${link("code", child(e.name))}">${e.name}</a></td><td class="kind"></td></tr>`
+			? html`<tr><td>📁 <a data-pane href="${link("code", child(e.name))}">${e.name}</a></td><td class="kind"></td></tr>`
 			: e.type === "gitlink"
 				? html`<tr><td>↗ ${e.name}</td><td class="kind">submodule</td></tr>`
-				: html`<tr><td>📄 <a href="${link("blob", child(e.name))}">${e.name}</a></td><td class="kind">${e.type === "symlink" ? "symlink" : ""}</td></tr>`,
+				: html`<tr><td>📄 <a data-pane href="${link("blob", child(e.name))}">${e.name}</a></td><td class="kind">${e.type === "symlink" ? "symlink" : ""}</td></tr>`,
 	)}
 	</tbody></table></div>
 </div>

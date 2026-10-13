@@ -30,7 +30,8 @@ A plain mirror would copy a force-push or a deleted branch and destroy the very 
 
 Every repository in the dashboard has a **Browse code** view that reads straight from the backup:
 
-- File tree with a picker for branches, tags, pull request heads and the kept snapshots of rewritten or deleted history.
+- A file tree down the left that opens folders as you click them, and switches files in place without reloading the page (back and forward still work).
+- A picker for branches, tags, pull request heads and the kept snapshots of rewritten or deleted history.
 - File view with line numbers and syntax highlighting, image previews, and a Raw link.
 - READMEs and other Markdown files rendered, with relative links and images pointing at the backed-up files.
 - Commit history per branch, and browsing the tree as of any commit.
@@ -200,7 +201,7 @@ One real run, on one personal account, set up with the CLI and a GitHub App:
 - **Every ref verified**: all 100 branches and 55 pull request heads (`refs/pull/*`) in Artifacts were compared with GitHub and matched.
 - **Restore**: a repository cloned back from Cloudflare with the dashboard's clone command was complete and matched GitHub.
 - **Metadata**: issues, pull requests, comments and labels were written to R2.
-- **Code browser**: file tree, file view, raw download, rendered README, commit history, browsing at a commit and the pull request picker all returned correct pages from real backups. The syntax colours themselves have not been eyeballed in a browser yet.
+- **Code browser**: file tree, file view, raw download, rendered README, commit history, browsing at a commit and the pull request picker all returned correct pages from real backups. A headless Chrome run confirmed the sidebar tree, in-place file switching, the back button and syntax colouring.
 
 ### Covered by local tests only
 
