@@ -175,18 +175,38 @@ export async function syncMetadataPage(
 	return { next: done ? null : page.next, stored: items.length };
 }
 
-/** Removes comment files written before they were grouped by issue number. */
-export async function removeFlatComments(bucket: R2Bucket, fullName: string): Promise<number> {
-	let removed = 0;
-	for (const dir of ["issue-comments/", "pull-comments/"]) {
+/**
+ * Moves comment files written before they were grouped by issue number to
+ * their new place. Nothing is dropped: a comment since deleted on GitHub
+ * exists only here, so each file is copied before its old key is removed.
+ */
+export async function regroupFlatComments(bucket: R2Bucket, fullName: string): Promise<number> {
+	let moved = 0;
+	for (const [dir, parent] of [
+		["issue-comments/", "issue_url"],
+		["pull-comments/", "pull_request_url"],
+	] as const) {
+		const prefix = metaPrefix(fullName) + dir;
 		let cursor: string | undefined;
 		do {
-			const page = await bucket.list({ prefix: metaPrefix(fullName) + dir, delimiter: "/", cursor });
-			const keys = page.objects.map((o) => o.key);
-			if (keys.length) await bucket.delete(keys);
-			removed += keys.length;
+			// The delimiter limits the listing to files directly in the folder.
+			const page = await bucket.list({ prefix, delimiter: "/", cursor });
+			for (const object of page.objects) {
+				const body = await bucket.get(object.key);
+				if (!body) continue;
+				const text = await body.text();
+				let number = "0";
+				try {
+					number = trailingNumber((JSON.parse(text) as Item)[parent]);
+				} catch {
+					// Unreadable JSON is kept as it is, under 0/.
+				}
+				await bucket.put(`${prefix}${number}/${object.key.slice(prefix.length)}`, text);
+				await bucket.delete(object.key);
+				moved++;
+			}
 			cursor = page.truncated ? page.cursor : undefined;
 		} while (cursor);
 	}
-	return removed;
+	return moved;
 }

@@ -2,7 +2,7 @@ import { WorkflowEntrypoint, type WorkflowEvent, type WorkflowStep } from "cloud
 import { NonRetryableError } from "cloudflare:workflows";
 import { ensureSchema, getAccount, getRepo, isBackedUp, type Repo, STARRED, updateRepo } from "./db.ts";
 import { gitBasicAuth, loadDeployment, tokenFor } from "./github.ts";
-import { META_VERSION, removeFlatComments, RESOURCES, syncMetadataPage } from "./metadata.ts";
+import { META_VERSION, regroupFlatComments, RESOURCES, syncMetadataPage } from "./metadata.ts";
 import { type GitRunner, runnerFor } from "./runner.ts";
 import { copyLfsObjects, type LfsObject, lfsManifestKey, pruneBundles, putRanged, putStream } from "./storage.ts";
 
@@ -201,7 +201,7 @@ export class BackupWorkflow extends WorkflowEntrypoint<Env, BackupParams> {
 			if (!plan.starred) {
 				const stored: Record<string, number> = {};
 				if (plan.metaUpgrade) {
-					await step.do("meta: upgrade layout", async () => removeFlatComments(env.BUCKET, plan.fullName));
+					await step.do("meta: upgrade layout", async () => regroupFlatComments(env.BUCKET, plan.fullName));
 				}
 				for (const resource of RESOURCES) {
 					let url: string | null = null;
