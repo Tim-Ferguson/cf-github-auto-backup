@@ -117,7 +117,6 @@ async function cloneCommands(env: Env, repo: Repo): Promise<CloneInfo[]> {
 		}
 		try {
 			const info = await handle.info();
-			if (!info.lastPushAt) continue;
 			const token = await handle.createToken("read", 3600);
 			// Basic auth takes the token without its ?expires= suffix.
 			const secret = token.plaintext.split("?")[0];

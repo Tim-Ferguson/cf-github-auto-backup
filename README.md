@@ -4,7 +4,7 @@ A personal, self-hosted backup of your GitHub repositories that runs entirely in
 
 If GitHub suspends your account tomorrow, you still have every branch, tag, pull request head, issue, review, release and LFS object, and you can `git clone` all of it straight from Cloudflare.
 
-> **Status: early.** It deploys to a live Cloudflare account and its sign-in, API and CLI work there. A full backup run against real Cloudflare Artifacts has not been confirmed yet. Both Artifacts and the `cf` CLI are in beta; see [Known unknowns](#known-unknowns).
+> **Status: early, but working.** A first live run backed up 60 repositories into Cloudflare Artifacts, and every branch and pull request head was verified identical to GitHub. Not yet exercised live: LFS, wikis, releases, the oversize bundle fallback and the force-push snapshots (those are covered by local tests only). Artifacts and the `cf` CLI are both in beta; see [Known unknowns](#known-unknowns).
 
 ## What gets backed up
 
@@ -177,9 +177,9 @@ GH_BACKUP_NO_CONTAINER=1 cf dev   # dashboard only, no Docker
 
 ## Known unknowns
 
-Things the Artifacts docs do not spell out, which the first real deploy will settle:
+Things the Artifacts docs do not spell out and that live use has not settled yet:
 
-- Whether Artifacts accepts pushes to custom ref namespaces (`refs/backup/*`, `refs/pull/*`). If not, the namespace in `container/sync.mjs` needs to move under `refs/heads/`.
+- Artifacts accepts `refs/pull/*` (confirmed live). `refs/backup/*` should behave the same but has not been exercised live yet.
 - Whether Artifacts accepts ref deletions and non-fast-forward updates over git push. The sync already tolerates refused deletions.
 - Whether very large first pushes need `http.postBuffer` tuning.
 - Metadata for repos with tens of thousands of issues may exceed the default Workflow step budget on the first run; later runs are incremental.

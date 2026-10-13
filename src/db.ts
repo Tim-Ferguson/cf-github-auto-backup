@@ -94,7 +94,7 @@ export interface Repo {
 	meta_cursor: string | null;
 	last_run_at: string | null;
 	last_success_at: string | null;
-	last_status: "ok" | "error" | "running" | null;
+	last_status: "ok" | "error" | "running" | "queued" | null;
 	last_error: string | null;
 	seen_at: string | null;
 	gone_at: string | null;

@@ -145,7 +145,9 @@ export async function discover(env: Env, dep: Deployment): Promise<{ accounts: n
 }
 
 function needsSync(repo: Repo): boolean {
-	if (repo.last_status === "running" && repo.last_run_at && Date.now() - Date.parse(repo.last_run_at) < DAY_MS / 4) return false;
+	// Already queued or in flight: a second instance would only repeat the work.
+	const pending = repo.last_status === "running" || repo.last_status === "queued";
+	if (pending && repo.last_run_at && Date.now() - Date.parse(repo.last_run_at) < DAY_MS / 4) return false;
 	if (repo.last_status !== "ok") return true;
 	if (repo.pushed_at !== repo.synced_pushed_at) return true;
 	// Issues and releases change without a push, so refresh daily regardless.
@@ -174,6 +176,11 @@ export async function queueDue(env: Env, trigger: string, opts: { all?: boolean 
 			params: { repoId: repo.id, trigger, force: false } satisfies BackupParams,
 		}));
 		await env.BACKUP_WORKFLOW.createBatch({ instances });
+		const now = new Date().toISOString();
+		await batched(
+			env.DB,
+			instances.map((i) => env.DB.prepare(`UPDATE repos SET last_status = 'queued', last_run_at = ? WHERE id = ? AND last_status IS NOT 'running'`).bind(now, i.params.repoId)),
+		);
 	}
 	return due.length;
 }
