@@ -256,6 +256,7 @@ One real run, on one personal account, set up with the CLI and a GitHub App:
 - **Every ref verified**: all 100 branches and 55 pull request heads (`refs/pull/*`) in Artifacts were compared with GitHub and matched.
 - **Restore**: a repository cloned back from Cloudflare with the dashboard's clone command was complete and matched GitHub.
 - **Metadata**: issues, pull requests, comments and labels were written to R2.
+- **Kept history, end to end**: a temporary branch was pushed, force-pushed and then deleted on a real repository, with a sync after each. The force-push moved 702 bytes and kept the overwritten commit under `refs/backup/rewritten/…`; the deletion moved nothing and kept the branch under `refs/backup/deleted/…`. A fresh clone of the backup contained both commits, with the original file content, and passed `git fsck`.
 - **Incremental sync**: against real GitHub and a scratch Artifacts repo, a hand-built partial fetch and push produced a backup that matched GitHub and passed `git fsck`. That run also confirmed Artifacts accepts `refs/backup/*` and `refs/pull/*`, non-fast-forward updates and ref deletions, and refuses an update whose expected old value is stale.
 - **A code review's fixes** (see the commit history): the live deployment was migrated in place with all 60 repositories still on, none marked gone, and syncs succeeding afterwards. The rate limiter held against 50 simultaneous guesses in a local test. The bundle-seeding fix is covered by a local test only.
 - **Theme toggle, per-repository switches and auto-import settings**: checked in headless Chrome against the live deployment.
@@ -270,8 +271,7 @@ One real run, on one personal account, set up with the CLI and a GitHub App:
 
 These work against local git repositories in `npm test` but have not run against real Artifacts yet:
 
-- Keeping force-pushed history under `refs/backup/rewritten/`.
-- Keeping deleted branches and tags under `refs/backup/deleted/`, including reuse of the name (`foo` deleted, `foo/bar` created).
+- Reusing a deleted branch name as a folder (`foo` deleted, `foo/bar` created).
 - Detecting LFS pointers across all history.
 - Falling back to a git bundle when a repo exceeds the Artifacts limits.
 - Refusing to touch the backup when the source has vanished.
@@ -285,8 +285,6 @@ If you try any of these, please open an issue with what happened, good or bad.
 | **Restore to GitHub** | `npm run cli -- restore <repo>` into a spare account or a throwaway name | A new repository with history, issues (same numbers), `[PR]` issues, releases, wiki and LFS. Only the dry run has been exercised; the part that writes to GitHub has never run. |
 | **Releases and wiki browsing** | Open the Releases and Wiki tabs on a repo that has them | Release notes with downloadable assets; wiki pages browsable with the home page rendered. |
 | **One-click deploy** | Click the Deploy to Cloudflare button above | Cloudflare asks for `ADMIN_PASSWORD`, builds the container and deploys. Unknown: whether the button accepts `cloudflare.config.ts` instead of a Wrangler config, and whether its build token can create the container and Artifacts resources. |
-| **Force-push** | Force-push a branch in a backed-up repo, then sync | The old commit appears under `refs/backup/rewritten/<timestamp>/…` in a `--mirror` clone. Unknown: whether Artifacts accepts the `refs/backup/*` namespace and non-fast-forward updates. |
-| **Deleted branch or tag** | Delete one on GitHub, then sync | It moves to `refs/backup/deleted/<timestamp>/…`. Unknown: whether Artifacts accepts ref deletions over push (the sync tolerates a refusal). |
 | **Git LFS** | Back up a repo that uses LFS | Objects land in R2 under `lfs/`, listed in `lfs-manifests/<repo id>.json`. |
 | **A large repo** | Back up one over 1 GB, or with a file over 32 MB | It is stored as `bundles/<repo id>/<timestamp>.bundle` in R2 and the dashboard marks it "bundle". |
 | **A big first push** | Back up a repo of several hundred MB | It succeeds. Unknown: whether very large pushes need `http.postBuffer` tuning. |
