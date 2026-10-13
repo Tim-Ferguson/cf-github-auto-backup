@@ -47,12 +47,14 @@ const server = createServer(async (req, res) => {
 		}
 		if (req.method === "POST" && pathname === "/sync") {
 			const body = await readJson(req);
-			if (job?.state === "running") {
-				// A retried start for the same job is fine; anything else is a conflict.
-				return job.id === body.id ? json(res, 202, { id: job.id }) : json(res, 409, { error: "busy" });
-			}
+			// A retried start for a job this container already has, running or
+			// finished, must not run it again: a second pass would find nothing
+			// new and replace the first one's results.
+			if (job?.id === body.id) return json(res, 202, { id: job.id });
+			if (job?.state === "running") return json(res, 409, { error: "busy" });
 			const current = (job = { id: body.id, state: "running", phase: "starting" });
-			const seedBundle = body.seeded && existsSync(SEED) ? SEED : undefined;
+			if (body.seeded && !existsSync(SEED)) return json(res, 409, { error: "the seed bundle did not arrive" });
+			const seedBundle = body.seeded ? SEED : undefined;
 			syncRepo(body, { workdir: WORKDIR, onPhase: (phase) => (current.phase = phase), seedBundle })
 				.then(
 					(result) => Object.assign(current, { state: "done", result }),

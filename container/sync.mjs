@@ -48,7 +48,12 @@ function git(cwd, args, { authHeader, input, inputFile, allowFail = false, onLin
 			env: { ...process.env, GIT_TERMINAL_PROMPT: "0", ...authEnv(authHeader) },
 			stdio: [input === undefined && !inputFile ? "ignore" : "pipe", "pipe", "pipe"],
 		});
-		if (inputFile) createReadStream(inputFile).pipe(child.stdin);
+		if (inputFile) {
+			// If git stops reading (a corrupt pack, say) the pipe breaks; that
+			// must reject this call, not crash the process.
+			child.stdin.on("error", () => {});
+			createReadStream(inputFile).on("error", reject).pipe(child.stdin);
+		}
 		let stdout = "";
 		let stderr = "";
 		if (onLine) {
@@ -232,15 +237,24 @@ async function syncIncremental(job, { workdir, onPhase = () => {}, now = new Dat
 		if (!fastForward) keep("rewritten", ref, oldSha);
 	}
 
-	// Snapshots and deletions first, so kept history is safe before anything
-	// moves and a reused name (`foo` -> `foo/bar`) finds its path clear.
+	// Three separate requests, in this order, and each must succeed before
+	// the next is sent. A push applies its ref updates one by one, so a
+	// snapshot sharing a request with the deletion it protects could be
+	// refused while the deletion went through.
+	//   1. snapshots: kept history is safe before anything is removed
+	//   2. deletions: clears the way for a reused name (`foo` -> `foo/bar`)
+	//   3. updates, with the new objects
 	onPhase("pushing to backup");
+	if (snapshots.length) {
+		const outcome = await pushCommands(target.url, target.authHeader, snapshots);
+		const refused = snapshots.find((s) => outcome.get(s.ref));
+		if (refused) throw new SyncError("GIT_FAILED", `could not keep ${refused.ref}: ${outcome.get(refused.ref)}`);
+	}
 	let deleteFailures = 0;
-	const removals = capabilities.has("delete-refs") ? deleted.map(([ref, sha]) => ({ ref, old: sha, new: ZERO })) : [];
 	if (!capabilities.has("delete-refs")) deleteFailures = deleted.length;
-	if (snapshots.length || removals.length) {
-		const outcome = await pushCommands(target.url, target.authHeader, [...snapshots, ...removals]);
-		for (const s of snapshots) if (outcome.get(s.ref)) throw new SyncError("GIT_FAILED", `could not keep ${s.ref}: ${outcome.get(s.ref)}`);
+	else if (deleted.length) {
+		const removals = deleted.map(([ref, sha]) => ({ ref, old: sha, new: ZERO }));
+		const outcome = await pushCommands(target.url, target.authHeader, removals);
 		for (const r of removals) if (outcome.get(r.ref)) deleteFailures++;
 	}
 	if (changed.length) {

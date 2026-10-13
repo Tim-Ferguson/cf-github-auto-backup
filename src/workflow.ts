@@ -4,7 +4,7 @@ import { ensureSchema, getAccount, getRepo, isBackedUp, type Repo, STARRED, upda
 import { gitBasicAuth, loadDeployment, tokenFor } from "./github.ts";
 import { META_VERSION, type PageResult, regroupFlatComments, RESOURCES, syncMetadataPage } from "./metadata.ts";
 import { type GitRunner, runnerFor } from "./runner.ts";
-import { copyLfsObjects, latestBundle, type LfsObject, lfsManifestKey, lfsPendingKey, metaPrefix, pruneBundles, putRanged } from "./storage.ts";
+import { copyLfsObjects, latestBundle, lfsKey, type LfsObject, lfsManifestKey, lfsPendingKey, metaPrefix, pruneBundles, putRanged } from "./storage.ts";
 
 export interface BackupParams {
 	repoId: number;
@@ -124,6 +124,7 @@ export class BackupWorkflow extends WorkflowEntrypoint<Env, BackupParams> {
 				starred: repo.account === STARRED,
 				pushedAt: repo.pushed_at,
 				bundled: repo.storage === "r2-bundle",
+				hasLfs: repo.lfs_count > 0,
 				sizeBytes: repo.size_bytes ?? 0,
 				// An older metadata layout gets one full resync instead of an incremental one.
 				metaCursor: repo.meta_version < META_VERSION ? null : repo.meta_cursor,
@@ -205,9 +206,14 @@ export class BackupWorkflow extends WorkflowEntrypoint<Env, BackupParams> {
 						const found = await res.json<LfsObject[]>();
 						// An incremental sync reports only new pointers; add them to the known ones.
 						const known = result.lfs.incremental ? ((await (await env.BUCKET.get(lfsManifestKey(repoId)))?.json<LfsObject[]>()) ?? []) : [];
-						const all = [...new Map([...known, ...found].map((o) => [o.oid, o])).values()];
+						const merge = (...lists: LfsObject[][]) => [...new Map(lists.flat().map((o) => [o.oid, o])).values()];
+						const all = merge(known, found);
+						// The pending list only ever grows here. Entries leave it once
+						// their object is confirmed in R2, so a copy that fails today is
+						// still owed tomorrow, even though no sync will find it again.
+						const owed = (await (await env.BUCKET.get(lfsPendingKey(repoId)))?.json<LfsObject[]>()) ?? [];
 						await env.BUCKET.put(lfsManifestKey(repoId), JSON.stringify(all));
-						await env.BUCKET.put(lfsPendingKey(repoId), JSON.stringify(found));
+						await env.BUCKET.put(lfsPendingKey(repoId), JSON.stringify(merge(owed, found)));
 						await updateRepo(env.DB, repoId, { lfs_count: all.length, lfs_bytes: all.reduce((n, o) => n + o.size, 0) });
 					});
 				}
@@ -237,21 +243,28 @@ export class BackupWorkflow extends WorkflowEntrypoint<Env, BackupParams> {
 				await runner().destroy().catch(() => {});
 			});
 
-			if (git && git.lfs.count > 0) {
+			// Copy whatever LFS objects are still owed, from this sync or an earlier one.
+			if (plan.hasLfs || (git && git.lfs.count > 0)) {
+				const owed = await step.do("lfs: owed", async () => ((await (await env.BUCKET.get(lfsPendingKey(repoId)))?.json<LfsObject[]>()) ?? []).length);
 				let copied = 0;
-				let missing = 0;
-				for (let offset = 0; offset < git.lfs.count; offset += LFS_BATCH) {
-					const res = await step.do(`lfs: copy ${offset}`, { timeout: "2 hours", retries: { limit: 3, delay: "1 minute", backoff: "exponential" } }, async () => {
-						const manifest = await env.BUCKET.get(lfsPendingKey(repoId));
-						if (!manifest) throw new NonRetryableError("LFS manifest is missing");
-						const objects = (await manifest.json<LfsObject[]>()).slice(offset, offset + LFS_BATCH);
-						const out = await copyLfsObjects(env.BUCKET, plan.fullName, await sourceToken(), objects);
-						return { copied: out.copied, missing: out.missing.length };
+				for (let offset = 0; offset < owed; offset += LFS_BATCH) {
+					copied += await step.do(`lfs: copy ${offset}`, { timeout: "2 hours", retries: { limit: 3, delay: "1 minute", backoff: "exponential" } }, async () => {
+						const pending = (await (await env.BUCKET.get(lfsPendingKey(repoId)))?.json<LfsObject[]>()) ?? [];
+						const out = await copyLfsObjects(env.BUCKET, plan.fullName, await sourceToken(), pending.slice(offset, offset + LFS_BATCH));
+						return out.copied;
 					});
-					copied += res.copied;
-					missing += res.missing;
 				}
-				detail.lfs = { objects: git.lfs.count, bytes: git.lfs.bytes, copied, missing };
+				if (owed > 0) {
+					// Keep only what is still not in R2; those are tried again next run.
+					const remaining = await step.do("lfs: settle", { timeout: "30 minutes" }, async () => {
+						const pending = (await (await env.BUCKET.get(lfsPendingKey(repoId)))?.json<LfsObject[]>()) ?? [];
+						const left: LfsObject[] = [];
+						for (const object of pending) if (!(await env.BUCKET.head(lfsKey(object.oid)))) left.push(object);
+						await env.BUCKET.put(lfsPendingKey(repoId), JSON.stringify(left));
+						return left.length;
+					});
+					detail.lfs = { owed, copied, stillMissing: remaining };
+				}
 			}
 
 			// Metadata of starred repos is skipped: popular projects have

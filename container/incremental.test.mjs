@@ -52,8 +52,14 @@ function serve(root, compare, knobs) {
 			const head = out.subarray(0, split).toString();
 			const status = Number(/^Status: (\d+)/m.exec(head)?.[1] ?? 200);
 			const headers = Object.fromEntries(head.split("\r\n").filter((l) => l && !l.startsWith("Status:")).map((l) => [l.slice(0, l.indexOf(":")), l.slice(l.indexOf(":") + 2)]));
+			const body = out.subarray(split + 4);
+			// Flip bytes in the middle of a protocol-v2 pack, as a bad transfer would.
+			if (knobs.corruptPack && req.headers["git-protocol"] && url.pathname.endsWith("/git-upload-pack") && body.length > 2000) {
+				for (let i = Math.floor(body.length / 2); i < Math.floor(body.length / 2) + 64; i++) body[i] ^= 0xff;
+				knobs.corruptPack = false; // one bad transfer; the retry is clean
+			}
 			res.writeHead(status, headers);
-			res.end(out.subarray(split + 4));
+			res.end(body);
 		});
 	});
 	return new Promise((resolve) => server.listen(0, "127.0.0.1", () => resolve(server)));
@@ -285,6 +291,56 @@ test("a failure on the incremental path falls back to a full sync", async () => 
 		assert.equal(result.mode, "full");
 		assert.match(result.fallback, /source/);
 		assert.equal(t.refs()["refs/heads/main"], tip, "the commit is backed up either way");
+	} finally {
+		t.cleanup();
+	}
+});
+
+test("a branch is never deleted from the backup unless its snapshot was stored", async () => {
+	const t = await setup();
+	try {
+		t.commit("a.txt", "one");
+		git(t.work, "checkout", "-q", "-b", "feature");
+		const tip = t.commit("f.txt", "feature work");
+		t.push("main", "feature");
+		await t.run();
+
+		// The backup refuses snapshot refs but would accept the deletion.
+		const hook = join(t.target, "hooks", "update");
+		writeFileSync(hook, '#!/bin/sh\ncase "$1" in refs/backup/*) echo "snapshots refused" >&2; exit 1;; esac\n', { mode: 0o755 });
+		t.push("--delete", "feature");
+
+		await assert.rejects(t.run(), "the sync fails rather than drop the branch");
+		assert.equal(t.refs()["refs/heads/feature"], tip, "the branch is still in the backup");
+		assert.equal(git(t.target, "cat-file", "-t", tip), "commit");
+
+		// Once snapshots are accepted again, the deletion goes through safely.
+		rmSync(hook);
+		const result = await t.run({}, new Date("2026-10-13T12:00:00Z"));
+		assert.equal(t.refs()["refs/backup/deleted/20261013T120000Z/heads/feature"], tip);
+		assert.equal(t.refs()["refs/heads/feature"], undefined);
+		assert.equal(result.deleted, 1);
+	} finally {
+		t.cleanup();
+	}
+});
+
+test("a corrupt pack from the source is rejected, not relayed", async () => {
+	const t = await setup();
+	try {
+		t.commit("a.txt", "one");
+		t.push("main");
+		await t.run();
+		// Random content, so the pack is large enough to damage in the middle.
+		const tip = t.commit("b.txt", Array.from({ length: 6000 }, () => Math.random().toString(36)).join("\n"));
+		t.push("main");
+
+		t.corruptPack = true;
+		const result = await t.run();
+		assert.equal(result.mode, "full", "the damaged transfer was abandoned");
+		assert.ok(result.fallback);
+		assert.equal(t.refs()["refs/heads/main"], tip);
+		assert.equal(git(t.target, "fsck", "--full", "--strict"), "");
 	} finally {
 		t.cleanup();
 	}
