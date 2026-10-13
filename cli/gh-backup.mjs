@@ -4,6 +4,7 @@
 //   npm run cli              interactive menu (runs setup first if needed)
 //   npm run cli -- setup     deploy and connect Cloudflare and GitHub
 //   npm run cli -- status | discover | sync | accounts | clone [repo] | open
+//   npm run cli -- restore [repo] [--to owner/name]   put a backup back on GitHub
 //
 // The deployment is protected by a password that setup uploads as the
 // ADMIN_PASSWORD secret in the same deploy, so it is never left unclaimed.
@@ -19,6 +20,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { createInterface } from "node:readline";
 import { fileURLToPath } from "node:url";
+import { restore } from "./restore.mjs";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 const STATE_FILE = join(ROOT, ".gh-backup.json");
@@ -503,6 +505,7 @@ async function clone(state, term) {
 
 const COMMANDS = {
 	setup,
+	restore: (state, _term, args = []) => restore({ state, api, say, step, ok, warn, ask, confirm, findRepo, Abort, dim, bold }, args),
 	status,
 	accounts,
 	clone,
@@ -531,7 +534,8 @@ async function menu(state) {
 			{ value: "accounts", label: "Choose what gets backed up", hint: "accounts, orgs, forks, single repos" },
 			{ value: "sync", label: "Sync everything now" },
 			{ value: "discover", label: "Refresh the repository list from GitHub" },
-			{ value: "clone", label: "Get a clone command to restore a repository" },
+			{ value: "clone", label: "Get a clone command for a repository" },
+			{ value: "restore", label: "Restore a repository to GitHub", hint: "history, issues, releases, wiki, LFS, into the account gh is signed in to" },
 			{ value: "open", label: "Open the dashboard" },
 			{ value: "setup", label: "Run setup again", hint: "redeploy or reconnect" },
 			{ value: null, label: "Quit" },
@@ -547,10 +551,12 @@ async function menu(state) {
 }
 
 async function main() {
-	const [command, arg] = process.argv.slice(2);
+	const [command, ...rest] = process.argv.slice(2);
+	const arg = rest.find((a) => !a.startsWith("--"));
 	const state = loadState();
 	if (command === "help" || command === "--help" || command === "-h") {
-		return say("Usage: npm run cli [-- setup | status | accounts | discover | sync [repo] | clone [repo] | open]");
+		say("Usage: npm run cli [-- setup | status | accounts | discover | sync [repo] | clone [repo] | restore [repo] | open]");
+		return say("       restore options: --to owner/name  --private | --public  --skip-issues  --skip-releases  --dry-run  --yes");
 	}
 	if (command && !COMMANDS[command]) throw new Abort(`Unknown command "${command}". Try: npm run cli -- help`);
 
@@ -560,7 +566,7 @@ async function main() {
 		await setup(state);
 		if (command) return;
 	}
-	if (command) return COMMANDS[command](state, arg);
+	if (command) return COMMANDS[command](state, arg, rest);
 	await menu(state);
 }
 

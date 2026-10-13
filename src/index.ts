@@ -3,6 +3,9 @@ import { ensureSchema, getAccount, getAllConfig, getConfig, getRepo, isBackedUp,
 import { discover, queueDue, startBackup } from "./discovery.ts";
 import { type AppConfig, type Deployment, gh, GitHubError, loadDeployment } from "./github.ts";
 import { handleCode, serveAsset } from "./code.ts";
+import { handleMeta, metaCounts } from "./metaview.ts";
+import { clearFailures, clientAddress, pruneFailures, recordFailure, retryAfter } from "./ratelimit.ts";
+import { lfsKey, lfsManifestKey, metaPrefix } from "./storage.ts";
 import { type CloneInfo, dashboardPage, lockedPage, loginPage, messagePage, repoPage, setupPage } from "./ui.ts";
 
 export { GitRunner } from "./runner.ts";
@@ -241,7 +244,14 @@ async function handleApi(request: Request, env: Env, url: URL, dep: Deployment |
 	const body = post ? ((await request.json().catch(() => ({}))) as Record<string, unknown>) : {};
 
 	const bearer = /^Bearer (.+)$/.exec(request.headers.get("Authorization") ?? "")?.[1];
-	if (!(await isPassword(password, bearer))) return json({ error: "missing or wrong password" }, 401);
+	if (!bearer) return json({ error: "missing password" }, 401);
+	const address = clientAddress(request);
+	const wait = await retryAfter(env.DB, address);
+	if (wait > 0) return Response.json({ error: `too many wrong passwords; try again in ${Math.ceil(wait / 60)} minute(s)` }, { status: 429, headers: { "Retry-After": String(wait) } });
+	if (!(await isPassword(password, bearer))) {
+		await recordFailure(env.DB, address);
+		return json({ error: "wrong password" }, 401);
+	}
 
 	if (path === "/github-token" && post) {
 		const token = body.token;
@@ -291,6 +301,30 @@ async function handleApi(request: Request, env: Env, url: URL, dep: Deployment |
 	if (accountMatch && post) {
 		if (!(await setAccount(env, decodeURIComponent(accountMatch[1]), body))) return json({ error: "no such account" }, 404);
 		return json(await refresh(env, dep, "settings"));
+	}
+
+	// Read access to everything a restore needs besides git itself.
+	const lfsMatch = /^\/lfs\/([0-9a-f]{64})$/.exec(path);
+	if (lfsMatch && !post) {
+		const object = await env.BUCKET.get(lfsKey(lfsMatch[1]));
+		return object ? new Response(object.body, { headers: { "content-type": "application/octet-stream", "content-length": String(object.size) } }) : json({ error: "not in this backup" }, 404);
+	}
+	const exportMatch = /^\/repos\/(\d+)\/(files|file|lfs)$/.exec(path);
+	if (exportMatch && !post) {
+		const repo = await getRepo(env.DB, Number(exportMatch[1]));
+		if (!repo) return json({ error: "no such repository" }, 404);
+		const prefix = metaPrefix(repo.full_name);
+		if (exportMatch[2] === "lfs") {
+			const manifest = await env.BUCKET.get(lfsManifestKey(repo.id));
+			return json(manifest ? await manifest.json() : []);
+		}
+		if (exportMatch[2] === "files") {
+			const listing = await env.BUCKET.list({ prefix: prefix + (url.searchParams.get("prefix") ?? ""), cursor: url.searchParams.get("cursor") ?? undefined });
+			return json({ files: listing.objects.map((o) => ({ key: o.key.slice(prefix.length), size: o.size })), cursor: listing.truncated ? listing.cursor : null });
+		}
+		const object = await env.BUCKET.get(prefix + (url.searchParams.get("key") ?? ""));
+		if (!object) return json({ error: "not in this backup" }, 404);
+		return new Response(object.body, { headers: { "content-type": "application/octet-stream", "content-length": String(object.size), "cache-control": "no-store" } });
 	}
 
 	const repoMatch = /^\/repos\/(\d+)(?:\/(sync|clone-token))?$/.exec(path);
@@ -348,6 +382,14 @@ async function handleApp(request: Request, env: Env, ctx: ExecutionContext, url:
 		return redirect("/");
 	}
 
+	const metaMatch = /^\/repos\/(\d+)\/(issues|pulls|releases|asset)(?:\/(.+))?$/.exec(path);
+	if (metaMatch && !post) {
+		const repo = await getRepo(env.DB, Number(metaMatch[1]));
+		if (!repo) return messagePage("Not found", "No such repository.", 404, { href: "/", label: "Back" });
+		const rest = (metaMatch[3] ?? "").split("/").filter(Boolean).map((part) => decodeURIComponent(part));
+		return handleMeta(env, url, repo, metaMatch[2] as "issues" | "pulls" | "releases" | "asset", rest);
+	}
+
 	const repoMatch = /^\/repos\/(\d+)(?:\/(override|sync|token|code|blob|raw|commits|tree))?$/.exec(path);
 	if (repoMatch) {
 		const id = Number(repoMatch[1]);
@@ -372,12 +414,13 @@ async function handleApp(request: Request, env: Env, ctx: ExecutionContext, url:
 		if (action === "token" && post) clones = await cloneCommands(env, repo);
 		else if (action) return redirect(`/repos/${id}`);
 
-		const [account, runs, bundles] = await Promise.all([
+		const [account, runs, bundles, counts] = await Promise.all([
 			getAccount(env.DB, repo.account),
 			env.DB.prepare(`SELECT * FROM runs WHERE repo_id = ? ORDER BY id DESC LIMIT 20`).bind(id).all<Run>(),
 			repo.storage === "r2-bundle" ? env.BUCKET.list({ prefix: `bundles/${id}/` }) : null,
+			metaCounts(env.DB, id),
 		]);
-		return repoPage({ repo, account, runs: runs.results, clones, bundles: bundles?.objects.map((o) => o.key).sort().reverse() ?? [], flash: message });
+		return repoPage({ repo, account, runs: runs.results, clones, bundles: bundles?.objects.map((o) => o.key).sort().reverse() ?? [], flash: message, counts });
 	}
 
 	return messagePage("Not found", "There is nothing at this address.", 404, { href: "/", label: "Back" });
@@ -412,11 +455,18 @@ export default {
 			if (path === "/auth/logout" && request.method === "POST") return redirect("/", [setCookie(SESSION_COOKIE, "", 0)]);
 			if (path === "/auth/token" && request.method === "POST") {
 				const given = (await request.formData()).get("password");
-				// A fixed pause blunts online guessing without any state to keep.
-				await scheduler.wait(750);
+				const address = clientAddress(request);
+				const wait = await retryAfter(env.DB, address);
+				if (wait > 0) {
+					const res = messagePage("Too many attempts", `Password sign-in is paused for about ${Math.ceil(wait / 60)} minute(s) after repeated wrong passwords.`, 429, { href: "/", label: "Back" });
+					res.headers.set("Retry-After", String(wait));
+					return res;
+				}
 				if (!(await isPassword(password, typeof given === "string" ? given : null))) {
+					await recordFailure(env.DB, address);
 					return messagePage("Wrong password", "That is not this deployment's password.", 401, { href: "/", label: "Try again" });
 				}
+				await clearFailures(env.DB, address);
 				return redirect("/", [setCookie(SESSION_COOKIE, await sign(secret, { login: ADMIN }, SESSION_TTL), SESSION_TTL)]);
 			}
 			if ((path === "/auth/login" || path === "/auth/callback") && dep?.app) return await handleOAuth(request, url, dep, dep.app, secret);
@@ -442,6 +492,7 @@ export default {
 
 	async scheduled(_controller, env): Promise<void> {
 		await ensureSchema(env.DB);
+		await pruneFailures(env.DB);
 		const dep = await loadDeployment(env.DB);
 		if (dep) await refresh(env, dep, "schedule");
 	},

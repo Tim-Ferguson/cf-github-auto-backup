@@ -2,7 +2,7 @@ import { WorkflowEntrypoint, type WorkflowEvent, type WorkflowStep } from "cloud
 import { NonRetryableError } from "cloudflare:workflows";
 import { ensureSchema, getAccount, getRepo, isBackedUp, type Repo, STARRED, updateRepo } from "./db.ts";
 import { gitBasicAuth, loadDeployment, tokenFor } from "./github.ts";
-import { RESOURCES, syncMetadataPage } from "./metadata.ts";
+import { META_VERSION, removeFlatComments, RESOURCES, syncMetadataPage } from "./metadata.ts";
 import { type GitRunner, runnerFor } from "./runner.ts";
 import { copyLfsObjects, type LfsObject, lfsManifestKey, pruneBundles, putRanged, putStream } from "./storage.ts";
 
@@ -94,7 +94,9 @@ export class BackupWorkflow extends WorkflowEntrypoint<Env, BackupParams> {
 				hasWiki: repo.has_wiki === 1,
 				starred: repo.account === STARRED,
 				pushedAt: repo.pushed_at,
-				metaCursor: repo.meta_cursor,
+				// An older metadata layout gets one full resync instead of an incremental one.
+				metaCursor: repo.meta_version < META_VERSION ? null : repo.meta_cursor,
+				metaUpgrade: repo.meta_version < META_VERSION && repo.meta_cursor !== null,
 				gitCurrent: !force && repo.storage !== null && repo.pushed_at === repo.synced_pushed_at,
 			};
 		});
@@ -198,13 +200,16 @@ export class BackupWorkflow extends WorkflowEntrypoint<Env, BackupParams> {
 			// hundreds of thousands of issues that are not yours to lose.
 			if (!plan.starred) {
 				const stored: Record<string, number> = {};
+				if (plan.metaUpgrade) {
+					await step.do("meta: upgrade layout", async () => removeFlatComments(env.BUCKET, plan.fullName));
+				}
 				for (const resource of RESOURCES) {
 					let url: string | null = null;
 					for (let page = 0; page < 2000; page++) {
 						const res: { next: string | null; stored: number } = await step.do(
 							`meta: ${resource.name} ${page}`,
 							{ timeout: "30 minutes", retries: { limit: 4, delay: "30 seconds", backoff: "exponential" } },
-							async () => syncMetadataPage(env.BUCKET, await sourceToken(), plan.fullName, resource, url, plan.metaCursor),
+							async () => syncMetadataPage(env.BUCKET, await sourceToken(), plan.fullName, resource, url, plan.metaCursor, { db: env.DB, repoId }),
 						);
 						stored[resource.name] = (stored[resource.name] ?? 0) + res.stored;
 						url = res.next;
@@ -222,6 +227,7 @@ export class BackupWorkflow extends WorkflowEntrypoint<Env, BackupParams> {
 					last_success_at: now,
 					synced_pushed_at: plan.pushedAt,
 					meta_cursor: plan.starred ? null : plan.startedAt,
+					meta_version: META_VERSION,
 				});
 				await env.DB.prepare(`UPDATE runs SET status = 'ok', finished_at = ?, detail = ? WHERE id = ?`).bind(now, JSON.stringify(detail), plan.runId).run();
 				// Keep the run log bounded.

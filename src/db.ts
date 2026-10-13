@@ -51,12 +51,37 @@ const SCHEMA = [
 		detail TEXT
 	)`,
 	`CREATE INDEX IF NOT EXISTS runs_repo ON runs (repo_id, id DESC)`,
+	`CREATE TABLE IF NOT EXISTS auth_failures (key TEXT PRIMARY KEY, count INTEGER NOT NULL, window_start INTEGER NOT NULL)`,
+	// Searchable index of the issue, pull request and release JSON kept in R2.
+	`CREATE TABLE IF NOT EXISTS meta_items (
+		repo_id INTEGER NOT NULL,
+		kind TEXT NOT NULL,
+		number INTEGER NOT NULL,
+		title TEXT NOT NULL,
+		state TEXT NOT NULL,
+		author TEXT,
+		created_at TEXT,
+		updated_at TEXT,
+		comments INTEGER NOT NULL DEFAULT 0,
+		PRIMARY KEY (repo_id, kind, number)
+	)`,
 ];
+
+// Columns added after the first release. SQLite has no ADD COLUMN IF NOT
+// EXISTS, so each runs on its own and "duplicate column" is the normal case.
+const MIGRATIONS = [`ALTER TABLE repos ADD COLUMN meta_version INTEGER NOT NULL DEFAULT 0`];
 
 let ready: Promise<unknown> | undefined;
 
 export function ensureSchema(db: D1Database): Promise<unknown> {
-	ready ??= db.batch(SCHEMA.map((sql) => db.prepare(sql))).catch((err) => {
+	ready ??= (async () => {
+		await db.batch(SCHEMA.map((sql) => db.prepare(sql)));
+		for (const sql of MIGRATIONS) {
+			await db.prepare(sql).run().catch((err) => {
+				if (!/duplicate column/i.test(String(err))) throw err;
+			});
+		}
+	})().catch((err) => {
 		ready = undefined;
 		throw err;
 	});
@@ -92,6 +117,8 @@ export interface Repo {
 	lfs_bytes: number;
 	synced_pushed_at: string | null;
 	meta_cursor: string | null;
+	/** Layout version of this repo's metadata in R2; see META_VERSION. */
+	meta_version: number;
 	last_run_at: string | null;
 	last_success_at: string | null;
 	last_status: "ok" | "error" | "running" | "queued" | null;

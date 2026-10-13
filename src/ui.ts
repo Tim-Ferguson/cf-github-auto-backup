@@ -56,10 +56,14 @@ td.name { white-space:normal; min-width:180px; }
 pre { background:var(--chip); padding:12px; border-radius:8px; overflow-x:auto; margin:8px 0; font:12px/1.5 ui-monospace,Menlo,monospace; }
 code { font:12px ui-monospace,Menlo,monospace; }
 ol, ul { padding-left:20px; } li { margin:4px 0; }
+.filterbar { margin-bottom:16px; } .filterbar input { flex:1 1 220px; max-width:360px; font:inherit; padding:6px 10px; border-radius:7px; border:1px solid var(--line); background:var(--card); color:var(--text); }
+.tabs { display:flex; flex-wrap:wrap; gap:4px; border-bottom:1px solid var(--line); margin-bottom:16px; }
+.tabs a { padding:8px 12px; text-decoration:none; border-bottom:2px solid transparent; margin-bottom:-1px; color:var(--muted); }
+.tabs a:hover { color:var(--text); } .tabs a[aria-current] { color:var(--text); border-bottom-color:var(--accent); font-weight:600; }
 input[type=text] { font:inherit; padding:6px 8px; border-radius:6px; border:1px solid var(--line); background:var(--card); color:var(--text); width:100%; max-width:320px; }
 `;
 
-const DEFAULT_CSP = "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; form-action 'self' https://github.com; base-uri 'none'; frame-ancestors 'none'";
+const DEFAULT_CSP = "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline' 'self'; form-action 'self' https://github.com; base-uri 'none'; frame-ancestors 'none'";
 
 export function page(title: string, body: Html, opts: { status?: number; csp?: string; head?: Html } = {}): Response {
 	const doc = html`<!doctype html>
@@ -88,6 +92,21 @@ ${opts.head ?? ""}
 
 /** Marks a string as already-safe HTML. Only for markup this Worker built itself. */
 export const raw = (value: string): Html => new Html(value);
+
+/** Section navigation shared by every page of one repository. */
+export function repoTabs(repo: { id: number; storage: string | null; has_wiki: number }, active: string, counts: Record<string, number> = {}): Html {
+	const base = `/repos/${repo.id}`;
+	const count = (n: number | undefined) => (n ? html` <span class="chip">${n}</span>` : "");
+	const tab = (key: string, href: string, label: unknown) => html`<a href="${href}" ${key === active ? raw(`aria-current="page"`) : ""}>${label}</a>`;
+	return html`<nav class="tabs" aria-label="Repository sections">
+	${tab("overview", base, "Overview")}
+	${repo.storage === "artifacts" ? tab("code", `${base}/code`, "Code") : ""}
+	${tab("issues", `${base}/issues`, html`Issues${count(counts.issue)}`)}
+	${tab("pulls", `${base}/pulls`, html`Pull requests${count(counts.pull)}`)}
+	${tab("releases", `${base}/releases`, html`Releases${count(counts.release)}`)}
+	${repo.storage === "artifacts" && repo.has_wiki ? tab("wiki", `${base}/code?wiki=1`, "Wiki") : ""}
+</nav>`;
+}
 
 export function ago(iso: string | null): string {
 	if (!iso) return "never";
@@ -174,6 +193,13 @@ function statusCell(repo: Repo, backedUp: boolean): Html {
 	return html`<span class="muted">${backedUp ? "queued" : "–"}</span>`;
 }
 
+/** One word per repo for the dashboard filter. */
+function filterState(repo: Repo, backedUp: boolean): string {
+	if (repo.gone_at) return "gone";
+	if (!backedUp) return "off";
+	return repo.last_status === "error" ? "error" : "on";
+}
+
 function toggle(action: string, field: string, on: boolean, label: string): Html {
 	return html`<form method="post" action="${action}"><input type="hidden" name="${field}" value="${on ? "0" : "1"}"><button class="${on ? "on" : ""}" type="submit">${label}: ${on ? "on" : "off"}</button></form>`;
 }
@@ -208,7 +234,7 @@ export function dashboardPage(d: DashboardData): Response {
 		const base = `/accounts/${encodeURIComponent(account.login)}`;
 		const rows = repos.map((repo) => {
 			const backedUp = isBackedUp(repo, account);
-			return html`<tr>
+			return html`<tr data-name="${repo.full_name.toLowerCase()}" data-state="${filterState(repo, backedUp)}">
 	<td class="name"><a class="link" href="/repos/${repo.id}">${repo.full_name}</a>${repo.private ? html`<span class="chip">private</span>` : ""}${repo.fork ? html`<span class="chip">fork</span>` : ""}${repo.archived ? html`<span class="chip">archived</span>` : ""}${repo.storage === "r2-bundle" ? html`<span class="chip" title="Too large for Artifacts; stored as a git bundle in R2">bundle</span>` : ""}</td>
 	<td><form method="post" action="/repos/${repo.id}/override"><select name="override" onchange="this.form.submit()" aria-label="Backup setting for ${repo.full_name}">
 		<option value="" ${repo.override === null ? new Html("selected") : ""}>Follow account (${isBackedUp({ ...repo, override: null }, account) ? "on" : "off"})</option>
@@ -220,7 +246,7 @@ export function dashboardPage(d: DashboardData): Response {
 	<td class="muted">${bytes(repo.size_bytes === null ? null : repo.size_bytes + repo.lfs_bytes)}</td>
 </tr>`;
 		});
-		return html`<div class="card">
+		return html`<div class="card" data-account>
 	<div class="row spread">
 		<div class="row">${accountTitle(account)}<span class="muted small">${repos.length} repos</span></div>
 		<div class="row">${toggle(base, "enabled", account.enabled === 1, "Back up")}${account.kind === "starred" ? "" : toggle(base, "include_forks", account.include_forks === 1, "Include forks")}</div>
@@ -249,7 +275,21 @@ ${d.config.github_error ? html`<div class="banner"><b class="bad">GitHub has bee
 	<div class="tile"><b>${kept}</b><span class="muted">kept after leaving GitHub</span></div>
 	<div class="tile"><b>${bytes(size)}</b><span class="muted">stored</span></div>
 </div>
+${
+	d.repos.length
+		? html`<div class="row filterbar" role="search">
+	<input id="q" type="search" placeholder="Filter repositories (press /)" aria-label="Filter repositories" autocomplete="off">
+	<button type="button" class="on" data-filter="all">All ${d.repos.length}</button>
+	<button type="button" data-filter="on">Backed up ${active.length}</button>
+	<button type="button" data-filter="error">Failing ${failing}</button>
+	<button type="button" data-filter="off">Off ${d.repos.filter((r) => !r.gone_at && !isBackedUp(r, accounts.get(r.account))).length}</button>
+	<button type="button" data-filter="gone">Gone ${d.repos.filter((r) => r.gone_at).length}</button>
+	<span id="shown" class="muted small" aria-live="polite"></span>
+</div>`
+		: ""
+}
 ${sections.length ? sections : html`<div class="card"><p>Nothing here yet. ${d.slug ? html`<a class="link" href="https://github.com/apps/${d.slug}/installations/new">Install the app</a> on your account to start.` : "Use Refresh from GitHub to list your repositories."}</p></div>`}`,
+		{ head: html`<script src="/assets/dash.js" defer></script>` },
 	);
 }
 
@@ -259,7 +299,7 @@ export interface CloneInfo {
 	expiresAt: string;
 }
 
-export function repoPage(d: { repo: Repo; account: Account | null; runs: Run[]; clones: CloneInfo[] | null; bundles: string[]; flash: string | null }): Response {
+export function repoPage(d: { repo: Repo; account: Account | null; runs: Run[]; clones: CloneInfo[] | null; bundles: string[]; flash: string | null; counts: Record<string, number> }): Response {
 	const { repo } = d;
 	const refs = repo.ref_counts ? (JSON.parse(repo.ref_counts) as Record<string, number>) : null;
 	const backedUp = isBackedUp(repo, d.account ?? undefined);
@@ -276,11 +316,11 @@ export function repoPage(d: { repo: Repo; account: Account | null; runs: Run[]; 
 <header class="top">
 	<div><a class="link small" href="/">← All repositories</a><h1>${repo.full_name}</h1></div>
 	<div class="row">
-		${repo.storage === "artifacts" ? html`<a class="btn primary" href="/repos/${repo.id}/code">Browse code</a>` : ""}
-		<form method="post" action="/repos/${repo.id}/sync"><button class="${repo.storage === "artifacts" ? "" : "primary"}" type="submit">Sync now</button></form>
+		<form method="post" action="/repos/${repo.id}/sync"><button class="primary" type="submit">Sync now</button></form>
 		${repo.gone_at ? "" : html`<a class="btn" href="https://github.com/${repo.full_name}">Open on GitHub</a>`}
 	</div>
 </header>
+${repoTabs(repo, "overview", d.counts)}
 ${d.flash ? html`<div class="flash">${d.flash}</div>` : ""}
 ${repo.gone_at ? html`<div class="banner"><b class="warn">This repository has not been visible on GitHub since ${repo.gone_at}.</b><br>Its backup is frozen and kept until you delete it yourself.</div>` : ""}
 <div class="tiles">

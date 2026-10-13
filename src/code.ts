@@ -10,9 +10,9 @@ import lightTheme from "@highlightjs/cdn-assets/styles/github.min.css?raw";
 import highlightJs from "@highlightjs/cdn-assets/highlight.min.js?raw";
 import type { Repo } from "./db.ts";
 import { type LinkContext, renderMarkdown } from "./markdown.ts";
-import { ago, bytes, html, messagePage, page, raw } from "./ui.ts";
+import { ago, bytes, html, messagePage, page, raw, repoTabs } from "./ui.ts";
 
-const CODE_CSP = "default-src 'none'; style-src 'unsafe-inline' 'self'; script-src 'self'; connect-src 'self'; img-src 'self' https: data:; form-action 'none'; base-uri 'none'; frame-ancestors 'none'";
+export const CODE_CSP = "default-src 'none'; style-src 'unsafe-inline' 'self'; script-src 'self'; connect-src 'self'; img-src 'self' https: data:; form-action 'none'; base-uri 'none'; frame-ancestors 'none'";
 const RAW_CSP = "sandbox; default-src 'none'; style-src 'unsafe-inline'; img-src data:";
 
 const MAX_VIEW_BYTES = 1024 * 1024;
@@ -128,6 +128,41 @@ const CLIENT_JS = `
 })();
 `;
 
+const DASHBOARD_JS = `
+(function () {
+	var q = document.getElementById("q");
+	if (!q) return;
+	var state = "all";
+	function apply() {
+		var term = q.value.trim().toLowerCase();
+		var shown = 0;
+		document.querySelectorAll("tr[data-name]").forEach(function (tr) {
+			var s = tr.dataset.state;
+			var match = (state === "all" || (state === "on" ? s === "on" || s === "error" : s === state)) && tr.dataset.name.indexOf(term) !== -1;
+			tr.hidden = !match;
+			if (match) shown++;
+		});
+		var filtering = term !== "" || state !== "all";
+		document.querySelectorAll("[data-account]").forEach(function (card) {
+			card.hidden = filtering && !card.querySelector("tr[data-name]:not([hidden])");
+		});
+		document.getElementById("shown").textContent = filtering ? shown + " shown" : "";
+	}
+	q.addEventListener("input", apply);
+	document.querySelectorAll("button[data-filter]").forEach(function (button) {
+		button.addEventListener("click", function () {
+			state = button.dataset.filter;
+			document.querySelectorAll("button[data-filter]").forEach(function (other) { other.classList.toggle("on", other === button); });
+			apply();
+		});
+	});
+	document.addEventListener("keydown", function (e) {
+		if (e.key === "/" && !/^(INPUT|SELECT|TEXTAREA)$/.test(document.activeElement.tagName)) { e.preventDefault(); q.focus(); }
+		if (e.key === "Escape" && document.activeElement === q) { q.value = ""; apply(); q.blur(); }
+	});
+})();
+`;
+
 const CODE_CSS = `
 .crumbs { font-size:15px; word-break:break-all; } .crumbs a { color:var(--accent); text-decoration:none; }
 .bar { display:flex; flex-wrap:wrap; gap:10px; align-items:center; justify-content:space-between; margin-bottom:12px; }
@@ -144,6 +179,9 @@ const CODE_CSS = `
 .md blockquote { margin:0; padding-left:14px; border-left:3px solid var(--line); color:var(--muted); }
 .md table { width:auto; } .md th, .md td { border:1px solid var(--line); white-space:normal; }
 .commit-msg { white-space:normal; }
+.state { display:inline-block; font-size:12px; font-weight:600; padding:1px 9px; border-radius:99px; border:1px solid currentColor; white-space:nowrap; }
+.state.merged { color:#8250df; } @media (prefers-color-scheme: dark) { .state.merged { color:#b392f0; } }
+.bar input[type=search] { font:inherit; padding:6px 10px; border-radius:7px; border:1px solid var(--line); background:var(--card); color:var(--text); width:240px; max-width:100%; }
 main:has(.browser) { max-width:1560px; }
 .browser { display:grid; grid-template-columns:290px minmax(0,1fr); gap:16px; align-items:start; }
 .side { position:sticky; top:12px; max-height:calc(100vh - 24px); overflow:auto; background:var(--card); border:1px solid var(--line); border-radius:10px; padding:10px 8px; font-size:13px; }
@@ -171,12 +209,13 @@ ${lightTheme}
 pre code.hljs { padding:0; overflow-x:visible; }
 `;
 
-const HEAD = raw(`<link rel="stylesheet" href="/assets/code.css"><script src="/assets/highlight.js" defer></script><script src="/assets/code.js" defer></script>`);
+export const HEAD = raw(`<link rel="stylesheet" href="/assets/code.css"><script src="/assets/highlight.js" defer></script><script src="/assets/code.js" defer></script>`);
 
 export function serveAsset(path: string): Response | null {
 	const assets: Record<string, [string, string]> = {
 		"/assets/highlight.js": [highlightJs, "text/javascript; charset=utf-8"],
 		"/assets/code.js": [CLIENT_JS, "text/javascript; charset=utf-8"],
+		"/assets/dash.js": [DASHBOARD_JS, "text/javascript; charset=utf-8"],
 		"/assets/code.css": [CODE_CSS, "text/css; charset=utf-8"],
 	};
 	const asset = assets[path];
@@ -197,6 +236,7 @@ const IMAGE_TYPES: Record<string, string> = { png: "image/png", jpg: "image/jpeg
 const extension = (name: string) => (name.includes(".") ? name.slice(name.lastIndexOf(".") + 1) : name).toLowerCase();
 const isMarkdown = (name: string) => /\.(md|markdown)$/i.test(name);
 const README = /^readme(\.(md|markdown|txt|rst))?$/i;
+const WIKI_HOME = /^home\.(md|markdown)$/i;
 
 interface Ref {
 	name: string;
@@ -287,24 +327,27 @@ export async function handleCode(env: Env, url: URL, repo: Repo, view: CodeView)
 		return messagePage("Nothing to browse", repo.storage === "r2-bundle" ? "This repository is stored as a git bundle in R2, which cannot be browsed here. Download the bundle to look inside." : "This repository has not been backed up yet.", 404, back);
 	}
 
+	// The wiki is its own git repository, backed up next to the code.
+	const wiki = url.searchParams.get("wiki") === "1";
+	const name = wiki ? `${repo.artifacts_name}.wiki` : repo.artifacts_name;
 	let handle: ArtifactsRepo;
 	try {
-		handle = await env.ARTIFACTS.get(repo.artifacts_name);
+		handle = await env.ARTIFACTS.get(name);
 	} catch {
-		return messagePage("Nothing to browse", "The backup for this repository could not be opened.", 404, back);
+		return messagePage("Nothing to browse", wiki ? "There is no wiki in this backup." : "The backup for this repository could not be opened.", 404, back);
 	}
 	try {
-		return await render(handle, url, repo, view);
+		return await render(handle, url, repo, view, name, wiki);
 	} finally {
 		handle[Symbol.dispose]();
 	}
 }
 
-async function render(handle: ArtifactsRepo, url: URL, repo: Repo, view: CodeView): Promise<Response> {
+async function render(handle: ArtifactsRepo, url: URL, repo: Repo, view: CodeView, name: string, wiki: boolean): Promise<Response> {
 	const base = `/repos/${repo.id}`;
 	const back = { href: base, label: "Back" };
-	const refs = await listRefs(handle, repo.artifacts_name!);
-	if (refs.length === 0) return messagePage("Empty repository", "This repository has no commits.", 404, back);
+	const refs = await listRefs(handle, name);
+	if (refs.length === 0) return messagePage(wiki ? "Empty wiki" : "Empty repository", wiki ? "This wiki has no pages." : "This repository has no commits.", 404, back);
 
 	const wanted = url.searchParams.get("ref");
 	const fallback = refs.find((r) => r.name === `refs/heads/${repo.default_branch}`) ?? refs.find((r) => r.name.startsWith("refs/heads/")) ?? refs[0];
@@ -312,7 +355,7 @@ async function render(handle: ArtifactsRepo, url: URL, repo: Repo, view: CodeVie
 	if (!current) return messagePage("No such branch", `${wanted} is not in this backup.`, 404, { href: `${base}/code`, label: "Browse the default branch" });
 
 	const path = (url.searchParams.get("path") ?? "").split("/").filter(Boolean).join("/");
-	const link = (kind: string, p = "", ref = current.name) => `${base}/${kind}?ref=${encodeURIComponent(ref)}${p ? `&path=${encodeURIComponent(p)}` : ""}`;
+	const link = (kind: string, p = "", ref = current.name) => `${base}/${kind}?ref=${encodeURIComponent(ref)}${p ? `&path=${encodeURIComponent(p)}` : ""}${wiki ? "&wiki=1" : ""}`;
 
 	const commit = await handle.readCommit(current.sha);
 	if (!commit) return messagePage("Not found", "That commit is not in this backup.", 404, back);
@@ -369,7 +412,7 @@ async function render(handle: ArtifactsRepo, url: URL, repo: Repo, view: CodeVie
 	const show = (title: string, body: unknown, status = 200) =>
 		page(
 			`${title} · ${repo.full_name}`,
-			html`<div class="browser">
+			html`${repoTabs(repo, wiki ? "wiki" : "code")}<div class="browser">
 <details class="side" open><summary>Files</summary><div class="repo"><a href="${link("code")}" title="${repo.full_name}">${repo.full_name.split("/")[1]}</a></div><nav id="tree" aria-label="Files">${treeList(found.trail[0], "", 0)}</nav></details>
 <div id="pane">${body}</div>
 </div>`,
@@ -404,7 +447,7 @@ ${commits.slice(0, COMMITS_PER_PAGE).map(
 		const child = (name: string) => (path ? `${path}/${name}` : name);
 
 		let readme: unknown = "";
-		const readmeEntry = entries.find((e) => e.type !== "tree" && README.test(e.name));
+		const readmeEntry = entries.find((e) => e.type !== "tree" && (README.test(e.name) || (wiki && !path && WIKI_HOME.test(e.name))));
 		if (readmeEntry) {
 			const blob = await handle.readBlob(readmeEntry.hash);
 			if (blob && blob.size <= MAX_README_BYTES) {
@@ -435,8 +478,8 @@ ${readme}`,
 
 	// A file.
 	if (view === "code") return Response.redirect(new URL(link("blob", path), url).toString(), 302);
-	const name = parts[parts.length - 1];
-	const ext = extension(name);
+	const fileName = parts[parts.length - 1];
+	const ext = extension(fileName);
 	const blob = await handle.readBlob(found.entry.hash);
 	if (!blob) return messagePage("Not found", "That file is not in this backup.", 404, back);
 
@@ -447,7 +490,7 @@ ${readme}`,
 			headers: {
 				"content-type": type,
 				"content-length": String(blob.size),
-				"content-disposition": `${IMAGE_TYPES[ext] || type.startsWith("text/") ? "inline" : "attachment"}; filename*=UTF-8''${encodeURIComponent(name)}`,
+				"content-disposition": `${IMAGE_TYPES[ext] || type.startsWith("text/") ? "inline" : "attachment"}; filename*=UTF-8''${encodeURIComponent(fileName)}`,
 				"content-security-policy": RAW_CSP,
 				"x-content-type-options": "nosniff",
 				"cache-control": "private, no-store",
@@ -456,16 +499,16 @@ ${readme}`,
 	}
 
 	const rawButton = html`<a class="btn" href="${link("raw", path)}">Raw</a>`;
-	const frame = (body: unknown) => show(name, html`${header(name, rawButton)}<div class="card"><div class="bar">${crumbs}<span class="muted small">${bytes(blob.size)}</span></div>${body}</div>`);
+	const frame = (body: unknown) => show(fileName, html`${header(fileName, rawButton)}<div class="card"><div class="bar">${crumbs}<span class="muted small">${bytes(blob.size)}</span></div>${body}</div>`);
 
-	if (IMAGE_TYPES[ext]) return frame(html`<div class="preview"><img src="${link("raw", path)}" alt="${name}"></div>`);
+	if (IMAGE_TYPES[ext]) return frame(html`<div class="preview"><img src="${link("raw", path)}" alt="${fileName}"></div>`);
 	if (blob.size > MAX_VIEW_BYTES) return frame(html`<p class="muted">This file is too large to show here. Use Raw to download it.</p>`);
 	const data = new Uint8Array(await blob.arrayBuffer());
 	if (looksBinary(data)) return frame(html`<p class="muted">Binary file. Use Raw to download it.</p>`);
 
 	const text = new TextDecoder().decode(data);
 	const plain = url.searchParams.get("plain") === "1";
-	if (isMarkdown(name) && !plain) {
+	if (isMarkdown(fileName) && !plain) {
 		return frame(html`<p class="small"><a class="link" href="${link("blob", path)}&plain=1">View source</a></p><article class="md">${raw(renderMarkdown(text, markdownContext(parts.slice(0, -1).join("/"))))}</article>`);
 	}
 

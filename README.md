@@ -38,6 +38,14 @@ Every repository in the dashboard has a **Browse code** view that reads straight
 
 Highlighting runs in your browser from a script served by your own Worker, so no third party sees what you open. Repositories stored as bundles (too large for Artifacts) cannot be browsed.
 
+The rest of the backup is browsable too, from tabs on each repository:
+
+- **Issues** and **Pull requests**: searchable lists, and each thread with its description, comments, reviews and review comments. A pull request links to its code as it was.
+- **Releases**: notes and downloadable assets.
+- **Wiki**: browsed like code, with its home page rendered.
+
+The dashboard has a filter box (press `/`) and quick filters for backed up, failing, off and gone.
+
 ## Choosing what to back up
 
 Out of the box only your own non-fork repositories are backed up. Everything else is a toggle in the dashboard:
@@ -109,7 +117,8 @@ npm run cli -- status          # what is backed up, what is failing
 npm run cli -- accounts        # toggle accounts, orgs, forks, single repos
 npm run cli -- sync [repo]     # sync everything, or one repo
 npm run cli -- discover        # refresh the repo list from GitHub
-npm run cli -- clone [repo]    # print a ready-to-paste restore command
+npm run cli -- clone [repo]    # print a ready-to-paste clone command
+npm run cli -- restore [repo]  # put a backup back on GitHub (see Restoring)
 npm run cli -- open            # open the dashboard
 ```
 
@@ -146,6 +155,30 @@ Syncs run on every push (bursts collapse into one per two minutes), every 6 hour
 
 ## Restoring
 
+### Back to GitHub in one command
+
+Sign the `gh` CLI in to the account you want to restore into (a new one, if the old one is gone), then:
+
+```sh
+gh auth login
+npm run cli -- restore <repo>              # asks where to put it
+npm run cli -- restore <repo> --dry-run    # shows what it would do, changes nothing
+```
+
+It creates the repository, then pushes or recreates:
+
+- every branch and tag, plus the kept snapshots of rewritten or deleted history as branches named `backup/…`
+- LFS objects (needs `git-lfs` installed) and the wiki
+- issues with their labels and comments, keeping their original numbers
+- pull requests as closed issues titled `[PR] …`, holding the description, reviews and review comments
+- releases and their assets
+
+Options: `--to owner/name`, `--private` or `--public`, `--skip-issues`, `--skip-releases`, `--yes`.
+
+What GitHub cannot take back: restored items are authored by you (original authors and dates are written into each one, without @-mentioning anyone), pull requests are not real pull requests, and stars, reactions, milestones, assignees, settings, secrets, webhooks and Actions history are not restored. Issue restore is slow on purpose, about a second per item, because GitHub throttles bulk creation.
+
+### By hand
+
 Open a repository in the dashboard and click **Create a 1-hour clone token**. You get a ready-to-paste command:
 
 ```sh
@@ -170,7 +203,8 @@ Everything else is plain files in the R2 bucket `gh-backup-data`:
 ## Security notes
 
 - The GitHub App is read-only and its private key lives in your D1 database, inside your Cloudflare account.
-- The dashboard, the setup page and the `/api/*` endpoints all require the `ADMIN_PASSWORD` secret; the GitHub account that created the app can also sign in with GitHub. Use a long random password, since the sign-in form is reachable from the internet, and keep `.gh-backup.json` private.
+- The dashboard, the setup page and the `/api/*` endpoints all require the `ADMIN_PASSWORD` secret; the GitHub account that created the app can also sign in with GitHub. Keep `.gh-backup.json` private.
+- Wrong passwords are rate limited: 5 per address in 15 minutes, and 300 an hour across all addresses, for both the sign-in form and the API. A sustained attack can therefore pause password sign-in for everyone until it stops; sign-in with GitHub keeps working.
 - In token mode the GitHub token sits in D1 in plain text and may carry write access. Prefer the GitHub App, or a fine-grained read-only token.
 - The app is created as *public* because GitHub only allows private apps to be installed on the account that owns them, which would rule out organizations. If a stranger installs it, their account appears in your dashboard switched off and nothing of theirs is backed up unless you turn it on.
 - To start over, delete the rows in the `config` table (`cf d1 query <database id> --sql "DELETE FROM config"`) and delete the app on GitHub.
@@ -201,6 +235,10 @@ One real run, on one personal account, set up with the CLI and a GitHub App:
 - **Every ref verified**: all 100 branches and 55 pull request heads (`refs/pull/*`) in Artifacts were compared with GitHub and matched.
 - **Restore**: a repository cloned back from Cloudflare with the dashboard's clone command was complete and matched GitHub.
 - **Metadata**: issues, pull requests, comments and labels were written to R2.
+- **Sign-in rate limit** (tested locally, since testing it live would lock out the tester): the sixth wrong password from an address is refused for 15 minutes, other addresses are unaffected, and a correct password resets the count.
+- **Dashboard filter**: search and the status filters, checked in headless Chrome.
+- **Issue and pull request browser**: lists, search and thread pages rendered from a real backup.
+- **Restore, dry run only**: `restore --dry-run` fetched a real backup and planned the restore correctly.
 - **Code browser**: file tree, file view, raw download, rendered README, commit history, browsing at a commit and the pull request picker all returned correct pages from real backups. A headless Chrome run confirmed the sidebar tree, in-place file switching, the back button and syntax colouring.
 
 ### Covered by local tests only
@@ -219,6 +257,8 @@ If you try any of these, please open an issue with what happened, good or bad.
 
 | What to try | How | What should happen |
 | --- | --- | --- |
+| **Restore to GitHub** | `npm run cli -- restore <repo>` into a spare account or a throwaway name | A new repository with history, issues (same numbers), `[PR]` issues, releases, wiki and LFS. Only the dry run has been exercised; the part that writes to GitHub has never run. |
+| **Releases and wiki browsing** | Open the Releases and Wiki tabs on a repo that has them | Release notes with downloadable assets; wiki pages browsable with the home page rendered. |
 | **One-click deploy** | Click the Deploy to Cloudflare button above | Cloudflare asks for `ADMIN_PASSWORD`, builds the container and deploys. Unknown: whether the button accepts `cloudflare.config.ts` instead of a Wrangler config, and whether its build token can create the container and Artifacts resources. |
 | **Force-push** | Force-push a branch in a backed-up repo, then sync | The old commit appears under `refs/backup/rewritten/<timestamp>/…` in a `--mirror` clone. Unknown: whether Artifacts accepts the `refs/backup/*` namespace and non-fast-forward updates. |
 | **Deleted branch or tag** | Delete one on GitHub, then sync | It moves to `refs/backup/deleted/<timestamp>/…`. Unknown: whether Artifacts accepts ref deletions over push (the sync tolerates a refusal). |
