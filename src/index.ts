@@ -2,6 +2,7 @@ import { hmacHex, randomToken, sha256Hex, sign, timingSafeEqual, unsign } from "
 import { ensureSchema, getAccount, getAllConfig, getConfig, getRepo, isBackedUp, listAccounts, listRepos, type Repo, type Run, setConfig, updateRepo } from "./db.ts";
 import { discover, queueDue, startBackup } from "./discovery.ts";
 import { type AppConfig, type Deployment, gh, GitHubError, loadDeployment } from "./github.ts";
+import { handleCode, serveAsset } from "./code.ts";
 import { type CloneInfo, dashboardPage, lockedPage, loginPage, messagePage, repoPage, setupPage } from "./ui.ts";
 
 export { GitRunner } from "./runner.ts";
@@ -347,12 +348,15 @@ async function handleApp(request: Request, env: Env, ctx: ExecutionContext, url:
 		return redirect("/");
 	}
 
-	const repoMatch = /^\/repos\/(\d+)(?:\/(override|sync|token))?$/.exec(path);
+	const repoMatch = /^\/repos\/(\d+)(?:\/(override|sync|token|code|blob|raw|commits))?$/.exec(path);
 	if (repoMatch) {
 		const id = Number(repoMatch[1]);
 		const action = repoMatch[2];
 		const repo = await getRepo(env.DB, id);
 		if (!repo) return messagePage("Not found", "No such repository.", 404, { href: "/", label: "Back" });
+		if (action === "code" || action === "blob" || action === "raw" || action === "commits") {
+			return post ? redirect(`/repos/${id}/code`) : handleCode(env, url, repo, action);
+		}
 
 		if (action === "override" && post) {
 			await updateRepo(env.DB, id, { override: parseOverride((await request.formData()).get("override")) });
@@ -384,6 +388,8 @@ export default {
 		const url = new URL(request.url);
 		const path = url.pathname;
 		if (path === "/healthz") return new Response("ok");
+		const asset = path.startsWith("/assets/") ? serveAsset(path) : null;
+		if (asset) return asset;
 		try {
 			await ensureSchema(env.DB);
 			const dep = await loadDeployment(env.DB);

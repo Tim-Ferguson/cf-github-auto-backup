@@ -59,7 +59,9 @@ ol, ul { padding-left:20px; } li { margin:4px 0; }
 input[type=text] { font:inherit; padding:6px 8px; border-radius:6px; border:1px solid var(--line); background:var(--card); color:var(--text); width:100%; max-width:320px; }
 `;
 
-export function page(title: string, body: Html, opts: { status?: number } = {}): Response {
+const DEFAULT_CSP = "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; form-action 'self' https://github.com; base-uri 'none'; frame-ancestors 'none'";
+
+export function page(title: string, body: Html, opts: { status?: number; csp?: string; head?: Html } = {}): Response {
 	const doc = html`<!doctype html>
 <html lang="en">
 <head>
@@ -68,6 +70,7 @@ export function page(title: string, body: Html, opts: { status?: number } = {}):
 <meta name="robots" content="noindex">
 <title>${title}</title>
 <style>${new Html(CSS)}</style>
+${opts.head ?? ""}
 </head>
 <body><main>${body}</main></body>
 </html>`;
@@ -76,11 +79,15 @@ export function page(title: string, body: Html, opts: { status?: number } = {}):
 		headers: {
 			"content-type": "text/html; charset=utf-8",
 			"cache-control": "no-store",
-			"content-security-policy": "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; form-action 'self' https://github.com; base-uri 'none'; frame-ancestors 'none'",
+			"content-security-policy": opts.csp ?? DEFAULT_CSP,
 			"referrer-policy": "same-origin",
+			"x-content-type-options": "nosniff",
 		},
 	});
 }
+
+/** Marks a string as already-safe HTML. Only for markup this Worker built itself. */
+export const raw = (value: string): Html => new Html(value);
 
 export function ago(iso: string | null): string {
 	if (!iso) return "never";
@@ -269,7 +276,8 @@ export function repoPage(d: { repo: Repo; account: Account | null; runs: Run[]; 
 <header class="top">
 	<div><a class="link small" href="/">← All repositories</a><h1>${repo.full_name}</h1></div>
 	<div class="row">
-		<form method="post" action="/repos/${repo.id}/sync"><button class="primary" type="submit">Sync now</button></form>
+		${repo.storage === "artifacts" ? html`<a class="btn primary" href="/repos/${repo.id}/code">Browse code</a>` : ""}
+		<form method="post" action="/repos/${repo.id}/sync"><button class="${repo.storage === "artifacts" ? "" : "primary"}" type="submit">Sync now</button></form>
 		${repo.gone_at ? "" : html`<a class="btn" href="https://github.com/${repo.full_name}">Open on GitHub</a>`}
 	</div>
 </header>

@@ -26,6 +26,17 @@ A plain mirror would copy a force-push or a deleted branch and destroy the very 
 - **Repos that vanish from GitHub** (deleted, access revoked, or your account banned): marked "gone from GitHub · kept". The backup is frozen and nothing is ever deleted automatically.
 - **GitHub refusing the app entirely**: the dashboard shows a banner with the date it started, and every backup stays as it was.
 
+## Browse your code without GitHub
+
+Every repository in the dashboard has a **Browse code** view that reads straight from the backup:
+
+- File tree with a picker for branches, tags, pull request heads and the kept snapshots of rewritten or deleted history.
+- File view with line numbers and syntax highlighting, image previews, and a Raw link.
+- READMEs and other Markdown files rendered, with relative links and images pointing at the backed-up files.
+- Commit history per branch, and browsing the tree as of any commit.
+
+Highlighting runs in your browser from a script served by your own Worker, so no third party sees what you open. Repositories stored as bundles (too large for Artifacts) cannot be browsed.
+
 ## Choosing what to back up
 
 Out of the box only your own non-fork repositories are backed up. Everything else is a toggle in the dashboard:
@@ -124,6 +135,7 @@ dashboard ────────┘                      │
 ```
 
 - **Worker** (`src/index.ts`): dashboard, GitHub App setup and sign-in, webhook receiver, cron, and the JSON API the CLI talks to.
+- **Code browser** (`src/code.ts`, `src/markdown.ts`): reads trees, files and commits through the Artifacts binding. Repository content is treated as untrusted: Markdown HTML is rebuilt from an allowlist, the pages allow no inline script or forms, and raw files are served sandboxed.
 - **CLI** (`cli/gh-backup.mjs`): setup wizard and control panel. Plain Node, no dependencies.
 - **Workflow** (`src/workflow.ts`): one durable, retried run per repository. Skips the git step when nothing was pushed since the last sync.
 - **Container** (`container/`): Alpine, git and about 300 lines of Node. It fetches the existing backup from Artifacts, fetches from GitHub on top, snapshots anything that was rewritten or deleted, and pushes the result. Credentials are passed through the environment, never the command line.
@@ -188,6 +200,7 @@ One real run, on one personal account, set up with the CLI and a GitHub App:
 - **Every ref verified**: all 100 branches and 55 pull request heads (`refs/pull/*`) in Artifacts were compared with GitHub and matched.
 - **Restore**: a repository cloned back from Cloudflare with the dashboard's clone command was complete and matched GitHub.
 - **Metadata**: issues, pull requests, comments and labels were written to R2.
+- **Code browser**: file tree, file view, raw download, rendered README, commit history, browsing at a commit and the pull request picker all returned correct pages from real backups. The syntax colours themselves have not been eyeballed in a browser yet.
 
 ### Covered by local tests only
 
@@ -221,6 +234,8 @@ If you try any of these, please open an issue with what happened, good or bad.
 | **Sync on push** | Push to a backed-up repo (GitHub App mode) | A sync starts within a couple of minutes, with trigger "push" in the repo's run list. |
 | **Losing access** | Uninstall the app from an account, or remove a repo from it | The repos show "gone from GitHub · kept" and stay cloneable from Cloudflare. |
 | **Long repo names** | Back up a repo whose `owner/repo` is longer than 56 characters | It works under a truncated Artifacts name. The 56-character cap is a guess at Artifacts' limit. |
+| **Code browser** | Open **Browse code** on repos with unusual content: huge files, binaries, submodules, symlinks, non-UTF-8 text, thousands of branches | Pages load, large or binary files offer Raw instead of rendering. Each page view costs a few Artifacts operations. |
+| **README rendering** | Open a repo whose README uses a lot of raw HTML, badges and relative images | It renders close to GitHub. Anything scripted, styled or form-like is stripped by design; report anything that looks wrong or gets through. |
 | **Other platforms** | Deploy from Linux or Windows, or with Docker Desktop | The CLI has only been run on macOS with Colima. |
 
 ## License
