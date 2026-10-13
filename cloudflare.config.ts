@@ -38,6 +38,8 @@ export default defineConfig({
 			}),
 		},
 		env: {
+			// Chosen at deploy time. Until it is set, the deployment stays locked.
+			ADMIN_PASSWORD: bindings.secret(),
 			DB: bindings.d1({ name: `${WORKER_NAME}-db` }),
 			BUCKET: bindings.r2({ name: `${WORKER_NAME}-data` }),
 			ARTIFACTS: bindings.artifacts({ namespace: WORKER_NAME }),

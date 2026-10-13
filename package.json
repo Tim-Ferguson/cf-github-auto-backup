@@ -20,5 +20,12 @@
 		"cf": "^1.0.0-beta.16",
 		"typescript": "^7.0.2",
 		"vite": "^8.3.0"
+	},
+	"cloudflare": {
+		"bindings": {
+			"ADMIN_PASSWORD": {
+				"description": "The password for your backup dashboard. Use **at least 12 characters**; the site stays locked until this is set. Generate one with `openssl rand -base64 24`."
+			}
+		}
 	}
 }

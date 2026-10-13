@@ -77,7 +77,7 @@ export function page(title: string, body: Html, opts: { status?: number } = {}):
 			"content-type": "text/html; charset=utf-8",
 			"cache-control": "no-store",
 			"content-security-policy": "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; form-action 'self' https://github.com; base-uri 'none'; frame-ancestors 'none'",
-			"referrer-policy": "no-referrer",
+			"referrer-policy": "same-origin",
 		},
 	});
 }
@@ -128,24 +128,34 @@ export function setupPage(origin: string, state: string, manifest: object): Resp
 		<button class="primary" type="submit">Create the GitHub App</button>
 	</form>
 	<p class="muted small">Prefer the terminal? <code>npm run cli</code> can connect GitHub with a token from the <code>gh</code> CLI instead, with no app at all.</p>
-	<p class="muted small">The app is created as public so that it can also be installed on organizations you belong to. Installations from anyone else show up switched off and are never backed up unless you enable them. Whoever completes this step becomes the owner of this deployment (${origin}).</p>
+	<p class="muted small">The app is created as public so that it can also be installed on organizations you belong to. Installations from anyone else show up switched off and are never backed up unless you enable them. The GitHub account that completes this step becomes the owner of this deployment (${origin}).</p>
 </div>`,
 	);
 }
 
-export function loginPage(owner: string | null, methods: { github: boolean; token: boolean }): Response {
+export function loginPage(owner: string | null, methods: { github: boolean }): Response {
 	return page(
 		"gh-backup",
 		html`<div class="card">
 	<h1>gh-backup</h1>
-	<p>${owner ? html`Sign in to manage the backup of <b>${owner}</b>.` : "This deployment was set up from the command line. Sign in with its admin token to continue."}</p>
-	${methods.github ? html`<p><a class="btn primary" href="/auth/login">Sign in with GitHub</a></p>` : ""}
-	${
-		methods.token
-			? html`<form method="post" action="/auth/token"><p><label for="token" class="muted small">Admin token (printed by <code>npm run cli</code>, stored in <code>.gh-backup.json</code>)</label><br><input id="token" type="password" name="token" autocomplete="current-password" required> <button type="submit" class="${methods.github ? "" : "primary"}">Sign in with token</button></p></form>`
-			: ""
-	}
+	<p>${owner ? html`Sign in to manage the backup of <b>${owner}</b>.` : "Enter the password you chose when deploying to connect GitHub and start backing up."}</p>
+	<form method="post" action="/auth/token"><p><label for="password" class="muted small">Password</label><br><input id="password" type="password" name="password" autocomplete="current-password" required autofocus> <button type="submit" class="primary">Sign in</button></p></form>
+	${methods.github ? html`<p><a class="btn" href="/auth/login">Sign in with GitHub instead</a></p>` : ""}
+	<p class="muted small">Forgot it? Set a new one by updating the <code>ADMIN_PASSWORD</code> secret on this Worker in the Cloudflare dashboard.</p>
 </div>`,
+	);
+}
+
+/** Shown for every request until a usable password secret exists. */
+export function lockedPage(minLength: number): Response {
+	return page(
+		"gh-backup is locked",
+		html`<div class="card">
+	<h1>This deployment is locked</h1>
+	<p>No password has been set, so nobody can use it yet, including whoever finds this address.</p>
+	<p>To unlock it, add a secret named <code>ADMIN_PASSWORD</code> (at least ${minLength} characters) to this Worker: in the Cloudflare dashboard open the Worker, then <b>Settings → Variables and Secrets → Add</b>. Or run <code>npm run cli</code> from the project, which sets one for you.</p>
+</div>`,
+		{ status: 503 },
 	);
 }
 

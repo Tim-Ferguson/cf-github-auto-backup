@@ -2,7 +2,7 @@ import { hmacHex, randomToken, sha256Hex, sign, timingSafeEqual, unsign } from "
 import { ensureSchema, getAccount, getAllConfig, getConfig, getRepo, isBackedUp, listAccounts, listRepos, type Repo, type Run, setConfig, updateRepo } from "./db.ts";
 import { discover, queueDue, startBackup } from "./discovery.ts";
 import { type AppConfig, type Deployment, gh, GitHubError, loadDeployment } from "./github.ts";
-import { type CloneInfo, dashboardPage, loginPage, messagePage, repoPage, setupPage } from "./ui.ts";
+import { type CloneInfo, dashboardPage, lockedPage, loginPage, messagePage, repoPage, setupPage } from "./ui.ts";
 
 export { GitRunner } from "./runner.ts";
 export { BackupWorkflow } from "./workflow.ts";
@@ -10,8 +10,9 @@ export { BackupWorkflow } from "./workflow.ts";
 const SESSION_COOKIE = "ghb_session";
 const STATE_COOKIE = "ghb_state";
 const SESSION_TTL = 30 * 24 * 60 * 60;
-/** Session identity of someone who signed in with the CLI's admin token. */
+/** Session identity of someone who signed in with the deployment password. */
 const ADMIN = "*admin";
+const MIN_PASSWORD_LENGTH = 12;
 
 function cookie(request: Request, name: string): string | undefined {
 	for (const part of (request.headers.get("Cookie") ?? "").split(/;\s*/)) {
@@ -52,8 +53,26 @@ async function checkState(request: Request, secret: string, state: string | null
 	return !!saved && !!state && timingSafeEqual(saved.state, state);
 }
 
-async function isAdminToken(adminHash: string | undefined, token: string | null | undefined): Promise<boolean> {
-	return !!adminHash && !!token && timingSafeEqual(adminHash, await sha256Hex(token));
+/** Browsers label where a request came from; fall back to Origin for older ones. */
+function isSameOrigin(request: Request, url: URL): boolean {
+	const site = request.headers.get("Sec-Fetch-Site");
+	if (site) return site === "same-origin";
+	return request.headers.get("Origin") === url.origin;
+}
+
+/**
+ * The ADMIN_PASSWORD secret is set at deploy time, so there is never a moment
+ * when a stranger who finds the URL could claim the deployment. Without a
+ * usable password everything stays locked.
+ */
+function deploymentPassword(env: Env): string | null {
+	const password = (env as { ADMIN_PASSWORD?: string }).ADMIN_PASSWORD;
+	return password && password.length >= MIN_PASSWORD_LENGTH ? password : null;
+}
+
+async function isPassword(password: string, candidate: string | null | undefined): Promise<boolean> {
+	// Hash both sides so the comparison is constant-time whatever the lengths.
+	return !!candidate && timingSafeEqual(await sha256Hex(password), await sha256Hex(candidate));
 }
 
 async function refresh(env: Env, dep: Deployment, trigger: string): Promise<{ accounts: number; repos: number; queued: number }> {
@@ -214,25 +233,15 @@ async function handleOAuth(request: Request, url: URL, dep: Deployment, app: App
 	return redirect("/", [setCookie(SESSION_COOKIE, session, SESSION_TTL), setCookie(STATE_COOKIE, "", 0)]);
 }
 
-// --- JSON API for the CLI, authenticated with the admin token ---
+// --- JSON API for the CLI, authenticated with the deployment password ---
 
-async function handleApi(request: Request, env: Env, url: URL, dep: Deployment | null, adminHash: string | undefined): Promise<Response> {
+async function handleApi(request: Request, env: Env, url: URL, dep: Deployment | null, password: string): Promise<Response> {
 	const path = url.pathname.slice("/api".length);
 	const post = request.method === "POST";
 	const body = post ? ((await request.json().catch(() => ({}))) as Record<string, unknown>) : {};
 
-	if (path === "/bootstrap" && post) {
-		// Same first-come rule as the browser setup: only an unclaimed
-		// deployment accepts an admin token.
-		if (adminHash || dep) return json({ error: "this deployment is already set up" }, 409);
-		const hash = body.admin_token_hash;
-		if (typeof hash !== "string" || !/^[0-9a-f]{64}$/.test(hash)) return json({ error: "admin_token_hash must be a SHA-256 hex digest" }, 400);
-		await setConfig(env.DB, { admin_token_hash: hash });
-		return json({ ok: true });
-	}
-
 	const bearer = /^Bearer (.+)$/.exec(request.headers.get("Authorization") ?? "")?.[1];
-	if (!(await isAdminToken(adminHash, bearer))) return json({ error: "missing or wrong admin token" }, 401);
+	if (!(await isPassword(password, bearer))) return json({ error: "missing or wrong password" }, 401);
 
 	if (path === "/github-token" && post) {
 		const token = body.token;
@@ -314,7 +323,7 @@ async function handleApp(request: Request, env: Env, ctx: ExecutionContext, url:
 
 	if (path === "/" && !post) {
 		const [accounts, repos, config] = await Promise.all([listAccounts(env.DB), listRepos(env.DB), getAllConfig(env.DB)]);
-		return dashboardPage({ owner: dep.owner, signedInAs: signedInAs === ADMIN ? "admin token" : signedInAs, slug: dep.app?.slug ?? null, accounts, repos, config, flash: message });
+		return dashboardPage({ owner: dep.owner, signedInAs: signedInAs === ADMIN ? "the password" : `GitHub (${signedInAs})`, slug: dep.app?.slug ?? null, accounts, repos, config, flash: message });
 	}
 
 	if (path === "/discover" && post) {
@@ -379,37 +388,42 @@ export default {
 		try {
 			await ensureSchema(env.DB);
 			const dep = await loadDeployment(env.DB);
-			const adminHash = (await getConfig(env.DB, "admin_token_hash")) ?? undefined;
-
-			if (path.startsWith("/api/")) return await handleApi(request, env, url, dep, adminHash);
 			if (path === "/webhooks/github" && request.method === "POST" && dep?.app) return await handleWebhook(request, env, ctx, dep, dep.app);
 
-			// Session cookies are SameSite=Lax; the Origin check covers the rest.
-			if (request.method === "POST" && request.headers.get("Origin") !== url.origin) {
+			const password = deploymentPassword(env);
+			if (!password) {
+				if (path.startsWith("/api/")) return json({ error: "locked: set the ADMIN_PASSWORD secret" }, 503);
+				return lockedPage(MIN_PASSWORD_LENGTH);
+			}
+			if (path.startsWith("/api/")) return await handleApi(request, env, url, dep, password);
+
+			// Session cookies are SameSite=Lax; this covers the rest.
+			if (request.method === "POST" && !isSameOrigin(request, url)) {
 				return new Response("cross-origin request refused", { status: 403 });
 			}
 
 			const secret = await sessionSecret(env.DB);
 			if (path === "/auth/logout" && request.method === "POST") return redirect("/", [setCookie(SESSION_COOKIE, "", 0)]);
 			if (path === "/auth/token" && request.method === "POST") {
-				const token = (await request.formData()).get("token");
-				if (!(await isAdminToken(adminHash, typeof token === "string" ? token.trim() : null))) {
-					return messagePage("Wrong token", "That is not this deployment's admin token.", 401, { href: "/", label: "Try again" });
+				const given = (await request.formData()).get("password");
+				// A fixed pause blunts online guessing without any state to keep.
+				await scheduler.wait(750);
+				if (!(await isPassword(password, typeof given === "string" ? given : null))) {
+					return messagePage("Wrong password", "That is not this deployment's password.", 401, { href: "/", label: "Try again" });
 				}
 				return redirect("/", [setCookie(SESSION_COOKIE, await sign(secret, { login: ADMIN }, SESSION_TTL), SESSION_TTL)]);
 			}
 			if ((path === "/auth/login" || path === "/auth/callback") && dep?.app) return await handleOAuth(request, url, dep, dep.app, secret);
 
 			const session = await unsign<{ login: string }>(secret, cookie(request, SESSION_COOKIE));
-			const signedIn = !!session && (session.login === ADMIN ? !!adminHash : !!dep && session.login.toLowerCase() === dep.owner.toLowerCase());
+			const signedIn = !!session && (session.login === ADMIN || (!!dep && session.login.toLowerCase() === dep.owner.toLowerCase()));
 
 			if (!dep) {
-				// Unclaimed deployments let the first visitor create the GitHub
-				// App. Once the CLI has set an admin token, that token is needed.
-				if (adminHash && !signedIn) return path === "/" ? loginPage(null, { github: false, token: true }) : redirect("/");
+				// Only someone who knows the password can connect GitHub.
+				if (!signedIn) return path === "/" ? loginPage(null, { github: false }) : redirect("/");
 				return await handleSetup(request, env, url, secret);
 			}
-			if (!signedIn) return path === "/" ? loginPage(dep.owner, { github: !!dep.app, token: !!adminHash }) : redirect("/");
+			if (!signedIn) return path === "/" ? loginPage(dep.owner, { github: !!dep.app }) : redirect("/");
 			// A token-mode deployment can still be upgraded to a GitHub App.
 			if (!dep.app && (path === "/setup" || path === "/setup/callback")) return await handleSetup(request, env, url, secret);
 			return await handleApp(request, env, ctx, url, dep, session!.login);

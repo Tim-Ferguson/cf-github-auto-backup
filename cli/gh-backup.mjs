@@ -5,13 +5,17 @@
 //   npm run cli -- setup     deploy and connect Cloudflare and GitHub
 //   npm run cli -- status | discover | sync | accounts | clone [repo] | open
 //
+// The deployment is protected by a password that setup uploads as the
+// ADMIN_PASSWORD secret in the same deploy, so it is never left unclaimed.
+//
 // Cloudflare auth comes from `cf auth login` or CLOUDFLARE_API_TOKEN and
 // CLOUDFLARE_ACCOUNT_ID (environment or .env). GitHub is connected with a
 // GitHub App (browser), the `gh` CLI's token, or a pasted token.
 
 import { spawn } from "node:child_process";
-import { createHash, randomBytes } from "node:crypto";
-import { chmodSync, existsSync, readFileSync, writeFileSync } from "node:fs";
+import { randomBytes } from "node:crypto";
+import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { createInterface } from "node:readline";
 import { fileURLToPath } from "node:url";
@@ -143,12 +147,12 @@ function loadState() {
 	const state = existsSync(STATE_FILE) ? JSON.parse(readFileSync(STATE_FILE, "utf8")) : {};
 	return {
 		url: process.env.GH_BACKUP_URL ?? state.url ?? null,
-		adminToken: process.env.GH_BACKUP_ADMIN_TOKEN ?? state.adminToken ?? null,
+		password: process.env.GH_BACKUP_PASSWORD ?? state.password ?? state.adminToken ?? null,
 	};
 }
 
 function saveState(state) {
-	writeFileSync(STATE_FILE, JSON.stringify(state, null, "\t") + "\n", { mode: 0o600 });
+	writeFileSync(STATE_FILE, JSON.stringify({ url: state.url, password: state.password }, null, "\t") + "\n", { mode: 0o600 });
 	chmodSync(STATE_FILE, 0o600);
 }
 
@@ -174,7 +178,7 @@ function writeDotEnv(values) {
 async function api(state, path, body) {
 	const res = await fetch(`${state.url}/api${path}`, {
 		method: body === undefined ? "GET" : "POST",
-		headers: { Authorization: `Bearer ${state.adminToken}`, "content-type": "application/json" },
+		headers: { Authorization: `Bearer ${state.password}`, "content-type": "application/json" },
 		body: body === undefined ? undefined : JSON.stringify(body),
 	});
 	const data = await res.json().catch(() => ({ error: `unexpected response (${res.status})` }));
@@ -246,65 +250,83 @@ async function connectCloudflare() {
 	ok("Saved to .env (git-ignored, readable only by you)");
 }
 
+const MIN_PASSWORD_LENGTH = 12;
+
+async function choosePassword(state) {
+	step("3. Password");
+	say("The dashboard and this CLI are protected by a password that is set as part of the deploy,");
+	say("so the deployment is never open to whoever finds its address first.");
+	if (state.password) {
+		ok("Using the password saved in .gh-backup.json");
+		return;
+	}
+	const method = await choose("Which password?", [
+		{ value: "generate", label: "Generate a strong one", hint: "saved to .gh-backup.json; you can copy it from there" },
+		{ value: "own", label: "Choose my own", hint: `at least ${MIN_PASSWORD_LENGTH} characters` },
+	]);
+	if (method === "generate") {
+		state.password = randomBytes(24).toString("base64url");
+	} else {
+		for (;;) {
+			const first = await askSecret("Password:");
+			if (first.length < MIN_PASSWORD_LENGTH) {
+				warn(`Use at least ${MIN_PASSWORD_LENGTH} characters.`);
+				continue;
+			}
+			if ((await askSecret("Again:")) === first) {
+				state.password = first;
+				break;
+			}
+			warn("Those did not match.");
+		}
+	}
+	saveState(state);
+	ok("Saved to .gh-backup.json (git-ignored, readable only by you)");
+}
+
 async function deploy(state) {
-	step("3. Deploying to Cloudflare");
+	step("4. Deploying to Cloudflare");
 	if (state.url && !(await confirm(`Deploy again to ${state.url}?`, true))) return;
 
-	const result = await cf(["deploy"], { show: true });
+	// The password travels in a private temp file, never on a command line.
+	const dir = mkdtempSync(join(tmpdir(), "gh-backup-"));
+	const secretsFile = join(dir, "secrets.json");
+	let result;
+	try {
+		writeFileSync(secretsFile, JSON.stringify({ ADMIN_PASSWORD: state.password }), { mode: 0o600 });
+		result = await cf(["deploy", "--secrets-file", secretsFile], { show: true });
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
 	if (result.code !== 0) throw new Abort("The deploy failed; see the output above.");
 	const found = /https:\/\/[a-z0-9-]+(?:\.[a-z0-9-]+)*\.workers\.dev/i.exec(result.out)?.[0];
 	state.url = (await ask("Worker URL:", { fallback: found ?? state.url ?? "" })).replace(/\/+$/, "");
 	if (!/^https:\/\//.test(state.url)) throw new Abort("A https:// URL is needed.");
 	saveState(state);
+}
 
-	process.stdout.write("Waiting for the Worker to answer");
+/** A brand-new Worker can take a few seconds to serve the new version. */
+async function waitUntilReady(state) {
+	process.stdout.write("Waiting for the deployment to answer");
+	let last = "no response";
 	for (let i = 0; i < 40; i++) {
-		const up = await fetch(`${state.url}/healthz`).then((r) => r.ok, () => false);
-		if (up) {
+		const res = await fetch(`${state.url}/api/status`, { headers: { Authorization: `Bearer ${state.password}` } }).catch(() => null);
+		if (res?.ok) {
 			say("");
-			ok(`Live at ${state.url}`);
+			ok(`Live and password-protected at ${state.url}`);
 			return;
 		}
+		last = res ? `HTTP ${res.status}` : last;
+		if (res?.status === 401 && i > 6) break;
 		process.stdout.write(".");
 		await new Promise((r) => setTimeout(r, 3000));
 	}
 	say("");
-	throw new Abort(`${state.url} did not respond. Check the URL and run setup again.`);
-}
-
-async function claim(state) {
-	step("4. Admin token");
-	if (state.adminToken) {
-		const valid = await api(state, "/status").then(() => true, (err) => (err.status === 401 ? false : Promise.reject(err)));
-		if (valid) {
-			ok("The saved admin token works");
-			return;
-		}
-		warn("The saved admin token was not accepted.");
-	}
-
-	const token = randomBytes(32).toString("base64url");
-	const res = await fetch(`${state.url}/api/bootstrap`, {
-		method: "POST",
-		headers: { "content-type": "application/json" },
-		body: JSON.stringify({ admin_token_hash: createHash("sha256").update(token).digest("hex") }),
-	});
-	if (res.ok) {
-		state.adminToken = token;
-		saveState(state);
-		ok("Created an admin token and saved it to .gh-backup.json (git-ignored)");
-		say(dim("  It signs you in to the dashboard and authorizes this CLI. Only its hash is stored in Cloudflare."));
-		return;
-	}
-	if (res.status !== 409) throw new Abort(`Could not claim the deployment (${res.status}).`);
-
-	say("This deployment was already set up. Paste its admin token to manage it from here.");
-	state.adminToken = await askSecret("Admin token:");
-	await api(state, "/status").catch((err) => {
-		throw new Abort(err.status === 401 ? "That token was not accepted. If the deployment was set up in the browser only, it has no admin token: use the dashboard instead." : err.message);
-	});
-	saveState(state);
-	ok("Admin token accepted");
+	throw new Abort(
+		last === "HTTP 401"
+			? `${state.url} does not accept the saved password. If it was deployed elsewhere, set GH_BACKUP_PASSWORD or fix .gh-backup.json.`
+			: `${state.url} is not answering (${last}). Check the URL and run setup again.`,
+	);
 }
 
 async function githubTokenFromGh() {
@@ -334,8 +356,8 @@ async function connectGitHub(state) {
 
 	if (method === "app") {
 		say(`\nOpening ${bold(state.url)}`);
-		say(`Sign in there with this admin token, then click ${bold("Create the GitHub App")}:\n`);
-		say(`  ${state.adminToken}\n`);
+		say(`Sign in there with your password, then click ${bold("Create the GitHub App")}.`);
+		say(dim("  The password is in .gh-backup.json if you need to copy it."));
 		await openBrowser(state.url);
 		await ask("Press Enter here once the app is installed");
 		const after = await api(state, "/status");
@@ -363,8 +385,9 @@ async function setup(state) {
 	say(dim("Backs up your GitHub repositories into your own Cloudflare account."));
 	await checkPrerequisites();
 	await connectCloudflare();
+	await choosePassword(state);
 	await deploy(state);
-	await claim(state);
+	await waitUntilReady(state);
 	await connectGitHub(state);
 
 	step("6. What to back up");
@@ -496,7 +519,7 @@ const COMMANDS = {
 		ok(`${(await api(state, "/sync-all", {})).queued} sync(s) started`);
 	},
 	open: async (state) => {
-		say(`${state.url}\nAdmin token: ${state.adminToken}`);
+		say(`${state.url}\nPassword: ${state.password}`);
 		await openBrowser(state.url);
 	},
 };
@@ -531,9 +554,9 @@ async function main() {
 	}
 	if (command && !COMMANDS[command]) throw new Abort(`Unknown command "${command}". Try: npm run cli -- help`);
 
-	const ready = state.url && state.adminToken;
+	const ready = state.url && state.password;
 	if (command === "setup" || !ready) {
-		if (command && command !== "setup") throw new Abort("Not set up yet. Run: npm run cli -- setup  (or set GH_BACKUP_URL and GH_BACKUP_ADMIN_TOKEN)");
+		if (command && command !== "setup") throw new Abort("Not set up yet. Run: npm run cli -- setup  (or set GH_BACKUP_URL and GH_BACKUP_PASSWORD)");
 		await setup(state);
 		if (command) return;
 	}
