@@ -133,7 +133,23 @@ export function sanitizeHtml(fragment: string, ctx: LinkContext): string {
 	return out + escapeText(input.slice(last));
 }
 
+const MAX_MARKDOWN_BYTES = 200 * 1024;
+
+/**
+ * Renders Markdown, or falls back to plain escaped text. Input this large,
+ * or input that makes the parser throw, is someone else's content trying to
+ * be expensive, and it must not take the page down.
+ */
 export function renderMarkdown(source: string, ctx: LinkContext): string {
+	if (source.length > MAX_MARKDOWN_BYTES) return `<pre>${escapeText(source)}</pre>`;
+	try {
+		return render(source, ctx);
+	} catch {
+		return `<pre>${escapeText(source)}</pre>`;
+	}
+}
+
+function render(source: string, ctx: LinkContext): string {
 	const marked = new Marked({
 		gfm: true,
 		renderer: {

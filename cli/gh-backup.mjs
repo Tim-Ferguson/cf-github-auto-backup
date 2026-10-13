@@ -320,13 +320,17 @@ async function waitUntilReady(state) {
 	let last = "no response";
 	for (let i = 0; i < 40; i++) {
 		const res = await fetch(`${state.url}/api/status`, { headers: { Authorization: `Bearer ${state.password}` } }).catch(() => null);
+		// A second wrong password would only run into the sign-in rate limit.
+		if (res?.status === 401) {
+			last = "HTTP 401";
+			break;
+		}
 		if (res?.ok) {
 			say("");
 			ok(`Live and password-protected at ${state.url}`);
 			return;
 		}
 		last = res ? `HTTP ${res.status}` : last;
-		if (res?.status === 401 && i > 6) break;
 		process.stdout.write(".");
 		await new Promise((r) => setTimeout(r, 3000));
 	}
@@ -436,7 +440,7 @@ async function status(state) {
 	for (const account of s.accounts) {
 		const repos = s.repos.filter((r) => r.account === account.login);
 		const on = repos.filter((r) => r.backed_up).length;
-		say(`\n${bold(accountLabel(account))}  ${account.enabled ? green("backup on") : dim("backup off")}${account.kind === "starred" ? "" : account.include_forks ? ", forks included" : dim(", forks excluded")}  ${dim(`${on}/${repos.length} repos`)}`);
+		say(`\n${bold(accountLabel(account))}  ${dim(autoLabel(account))}  ${dim(`${on}/${repos.length} repos on`)}`);
 		const shown = repos.filter((r) => r.backed_up || r.gone_at || r.storage);
 		const width = Math.min(48, Math.max(0, ...shown.map((r) => r.full_name.length)));
 		for (const r of shown) say(`  ${r.full_name.padEnd(width)}  ${repoState(r)}  ${dim(ago(r.last_success_at))}`);
@@ -446,45 +450,62 @@ async function status(state) {
 	say(`\n${active.length} backed up, ${active.filter((r) => r.last_status === "error").length} failing, ${s.repos.filter((r) => r.gone_at && r.storage).length} kept after leaving GitHub`);
 }
 
+/** "public and private", "public only", "off"… for an account's auto-import setting. */
+function autoLabel(a) {
+	if (a.kind === "starred") return a.auto_public ? "new stars imported" : "off";
+	const which = a.auto_public && a.auto_private ? "all new repos" : a.auto_public ? "new public repos" : a.auto_private ? "new private repos" : null;
+	return which ? `auto-imports ${which}${a.include_forks ? ", forks too" : ""}` : "no auto-import";
+}
+
 async function accounts(state) {
 	for (;;) {
 		const s = await api(state, "/status");
 		const picked = await choose("What should be backed up?", [
-			...s.accounts.map((a) => ({
-				value: a,
-				label: accountLabel(a),
-				hint: `${a.enabled ? "on" : "off"}${a.kind === "starred" ? "" : a.include_forks ? ", with forks" : ", no forks"} · ${s.repos.filter((r) => r.account === a.login).length} repos`,
-			})),
-			{ value: "repo", label: "Override a single repository", hint: "always or never, regardless of its account" },
+			...s.accounts.map((a) => {
+				const repos = s.repos.filter((r) => r.account === a.login);
+				return { value: a, label: accountLabel(a), hint: `${repos.filter((r) => r.backed_up).length}/${repos.length} repos on · ${autoLabel(a)}` };
+			}),
+			{ value: "repo", label: "Switch a single repository on or off" },
 			{ value: null, label: "Done" },
 		]);
 		if (picked === null) return;
 
 		if (picked === "repo") {
 			const term = (await ask("Part of the repository name:")).toLowerCase();
-			const matches = s.repos.filter((r) => r.full_name.toLowerCase().includes(term)).slice(0, 15);
+			const matches = s.repos.filter((r) => r.full_name.toLowerCase().includes(term) && !r.gone_at).slice(0, 15);
 			if (!matches.length) {
 				warn("No repository matches that.");
 				continue;
 			}
-			const repo = await choose("Which one?", matches.map((r) => ({ value: r, label: r.full_name, hint: r.override === null ? "follows account" : r.override ? "always" : "never" })));
+			const repo = await choose("Which one?", matches.map((r) => ({ value: r, label: r.full_name, hint: r.backed_up ? "on" : "off" })));
 			const override = await choose(`Back up ${repo.full_name}?`, [
-				{ value: null, label: "Follow its account's setting" },
-				{ value: 1, label: "Always" },
-				{ value: 0, label: "Never" },
+				{ value: 1, label: "Yes" },
+				{ value: 0, label: "No", hint: "an existing backup is kept" },
 			]);
 			await api(state, `/repos/${repo.id}`, { override });
 			ok("Saved");
 			continue;
 		}
 
-		const options = [{ value: { enabled: !picked.enabled }, label: picked.enabled ? "Stop backing it up" : "Back it up" }];
-		if (picked.kind !== "starred") options.push({ value: { include_forks: !picked.include_forks }, label: picked.include_forks ? "Exclude its forks" : "Include its forks" });
-		options.push({ value: null, label: "Back" });
-		const change = await choose(accountLabel(picked), options);
+		const onOff = (flag) => (flag ? "now on" : "now off");
+		const options =
+			picked.kind === "starred"
+				? [{ value: { auto_public: !picked.auto_public }, label: "Back up repositories I star", hint: onOff(picked.auto_public) }]
+				: [
+						{ value: { auto_all: !(picked.auto_public && picked.auto_private) }, label: "Automatically import all new repos", hint: onOff(picked.auto_public && picked.auto_private) },
+						{ value: { auto_public: !picked.auto_public }, label: "Automatically import new public repos", hint: onOff(picked.auto_public) },
+						{ value: { auto_private: !picked.auto_private }, label: "Automatically import new private repos", hint: onOff(picked.auto_private) },
+						{ value: { include_forks: !picked.include_forks }, label: "Include forks when importing", hint: onOff(picked.include_forks) },
+					];
+		options.push(
+			{ value: { select: "all" }, label: "Back up every repo it has now" },
+			{ value: { select: "none" }, label: "Stop backing up every repo it has now", hint: "existing backups are kept" },
+			{ value: null, label: "Back" },
+		);
+		const change = await choose(`${accountLabel(picked)}  ${dim("(choosing a setting flips it)")}`, options);
 		if (!change) continue;
 		const result = await api(state, `/accounts/${encodeURIComponent(picked.login)}`, change);
-		ok(`Saved; ${result.queued} sync(s) started`);
+		ok(`Saved${result.queued ? `; ${result.queued} sync(s) started` : ""}`);
 	}
 }
 
@@ -526,9 +547,17 @@ async function move(state, wanted) {
 	if (!(await confirm("Go ahead?"))) return;
 
 	step("1. Deploying under the new name");
+	// The new name is only written down once a deploy under it has worked.
+	// A failed attempt must not leave later deploys creating a second Worker.
 	state.name = name;
+	let url;
+	try {
+		url = await runDeploy(state);
+	} catch (err) {
+		state.name = oldName === "gh-backup" ? null : oldName;
+		throw err;
+	}
 	saveState(state);
-	const url = await runDeploy(state);
 	if (!url) throw new Abort("Deployed, but the new address was not in the output. Find it in the Cloudflare dashboard and put it in .gh-backup.json as \"url\".");
 	state.url = url;
 	saveState(state);
@@ -582,7 +611,7 @@ const COMMANDS = {
 		ok(`${(await api(state, "/sync-all", {})).queued} sync(s) started`);
 	},
 	open: async (state) => {
-		say(`${state.url}\nPassword: ${state.password}`);
+		say(`${state.url}\n${dim("The password is in .gh-backup.json.")}`);
 		await openBrowser(state.url);
 	},
 };
@@ -617,7 +646,7 @@ async function main() {
 	const state = loadState();
 	if (command === "help" || command === "--help" || command === "-h") {
 		say("Usage: npm run cli [-- setup | status | accounts | discover | sync [repo] | clone [repo] | restore [repo] | move [name] | open]");
-		return say("       restore options: --to owner/name  --private | --public  --skip-issues  --skip-releases  --dry-run  --yes");
+		return say("       restore options: --to owner/name  --private | --public  --skip-issues  --skip-releases  --include-snapshots  --resume  --dry-run  --yes");
 	}
 	if (command && !COMMANDS[command]) throw new Abort(`Unknown command "${command}". Try: npm run cli -- help`);
 

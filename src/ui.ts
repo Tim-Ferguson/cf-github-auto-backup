@@ -24,14 +24,15 @@ export function html(strings: TemplateStringsArray, ...values: unknown[]): Html 
 }
 
 const CSS = `
-:root { --bg:#f6f7f9; --card:#fff; --text:#1c2330; --muted:#667085; --line:#e3e6ec; --accent:#f6821f; --ok:#16794c; --bad:#b42318; --warn:#8a5a00; --chip:#eef0f4; color-scheme: light dark; }
-@media (prefers-color-scheme: dark) { :root { --bg:#0f1319; --card:#171c25; --text:#e6e9ef; --muted:#98a2b3; --line:#283040; --ok:#4ccf8f; --bad:#ff8a7a; --warn:#f0b849; --chip:#222a37; } }
+:root { --bg:#f6f7f9; --card:#fff; --text:#1c2330; --muted:#667085; --line:#d9dee6; --accent:#f6821f; --ok:#16794c; --bad:#b42318; --warn:#8a5a00; --chip:#eef0f4; --link:#b45309; --merged:#8250df; color-scheme:light; }
+@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) { --bg:#0f1319; --card:#171c25; --text:#e6e9ef; --muted:#98a2b3; --line:#283040; --ok:#4ccf8f; --bad:#ff8a7a; --warn:#f0b849; --chip:#222a37; --link:#f6821f; --merged:#b392f0; color-scheme:dark; } }
+:root[data-theme="dark"] { --bg:#0f1319; --card:#171c25; --text:#e6e9ef; --muted:#98a2b3; --line:#283040; --ok:#4ccf8f; --bad:#ff8a7a; --warn:#f0b849; --chip:#222a37; --link:#f6821f; --merged:#b392f0; color-scheme:dark; }
 * { box-sizing: border-box; }
 body { margin:0; background:var(--bg); color:var(--text); font:14px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif; }
 main { max-width:1080px; margin:0 auto; padding:24px 16px 64px; }
 header.top { display:flex; flex-wrap:wrap; gap:12px; align-items:center; justify-content:space-between; margin-bottom:20px; }
 h1 { font-size:20px; margin:0; } h2 { font-size:16px; margin:0; } h3 { font-size:14px; margin:20px 0 8px; }
-a { color:inherit; } a.link { color:var(--accent); text-decoration:none; } a.link:hover { text-decoration:underline; }
+a { color:inherit; } a.link { color:var(--link); text-decoration:none; } a.link:hover { text-decoration:underline; }
 .muted { color:var(--muted); } .small { font-size:12px; }
 .card { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:16px; margin-bottom:16px; }
 .row { display:flex; flex-wrap:wrap; gap:10px; align-items:center; }
@@ -41,7 +42,7 @@ a { color:inherit; } a.link { color:var(--accent); text-decoration:none; } a.lin
 .tile b { display:block; font-size:22px; font-variant-numeric:tabular-nums; }
 button, .btn { font:inherit; padding:6px 12px; border-radius:7px; border:1px solid var(--line); background:var(--card); color:var(--text); cursor:pointer; text-decoration:none; display:inline-block; }
 button.primary, .btn.primary { background:var(--accent); border-color:var(--accent); color:#fff; font-weight:600; }
-button.on { border-color:var(--ok); color:var(--ok); }
+button.on:not(.switch), .btn.on { border-color:var(--accent); color:var(--text); box-shadow:inset 0 -2px 0 var(--accent); }
 select { font:inherit; padding:4px 6px; border-radius:6px; border:1px solid var(--line); background:var(--card); color:var(--text); max-width:100%; }
 form { margin:0; display:inline; }
 .scroll { overflow-x:auto; }
@@ -60,10 +61,21 @@ ol, ul { padding-left:20px; } li { margin:4px 0; }
 .tabs { display:flex; flex-wrap:wrap; gap:4px; border-bottom:1px solid var(--line); margin-bottom:16px; }
 .tabs a { padding:8px 12px; text-decoration:none; border-bottom:2px solid transparent; margin-bottom:-1px; color:var(--muted); }
 .tabs a:hover { color:var(--text); } .tabs a[aria-current] { color:var(--text); border-bottom-color:var(--accent); font-weight:600; }
-input[type=text] { font:inherit; padding:6px 8px; border-radius:6px; border:1px solid var(--line); background:var(--card); color:var(--text); width:100%; max-width:320px; }
+.topbar { display:flex; align-items:center; gap:12px; margin-bottom:18px; font-size:13px; }
+.topbar .brand { font-weight:700; text-decoration:none; } .topbar .grow { flex:1; }
+button.ghost { border-color:transparent; background:transparent; color:var(--muted); padding:4px 8px; } button.ghost:hover { color:var(--text); background:var(--chip); }
+button:focus-visible, .btn:focus-visible, a:focus-visible, select:focus-visible, input:focus-visible { outline:2px solid var(--accent); outline-offset:2px; }
+/* An on/off control that is still a plain submit button underneath. */
+.switch { position:relative; display:inline-flex; align-items:center; gap:8px; border:0; background:none; padding:4px 2px; color:var(--text); }
+.switch::before { content:""; flex:none; width:30px; height:18px; border-radius:99px; background:var(--line); transition:background .12s; }
+.switch::after { content:""; position:absolute; left:4px; top:50%; width:12px; height:12px; margin-top:-6px; border-radius:50%; background:#fff; box-shadow:0 1px 2px rgba(0,0,0,.35); transition:transform .12s; }
+.switch.on::before { background:var(--accent); } .switch.on::after { transform:translateX(12px); }
+.auto { display:flex; flex-wrap:wrap; align-items:center; gap:4px 14px; padding:10px 0 2px; margin-top:10px; border-top:1px solid var(--line); }
+.auto .label { color:var(--muted); font-size:12px; }
+input[type=text], input[type=password] { font:inherit; padding:6px 8px; border-radius:6px; border:1px solid var(--line); background:var(--card); color:var(--text); width:100%; max-width:320px; }
 `;
 
-const DEFAULT_CSP = "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline' 'self'; form-action 'self' https://github.com; base-uri 'none'; frame-ancestors 'none'";
+const DEFAULT_CSP = "default-src 'none'; style-src 'unsafe-inline'; script-src 'self'; form-action 'self' https://github.com; base-uri 'none'; frame-ancestors 'none'";
 
 export function page(title: string, body: Html, opts: { status?: number; csp?: string; head?: Html } = {}): Response {
 	const doc = html`<!doctype html>
@@ -74,9 +86,10 @@ export function page(title: string, body: Html, opts: { status?: number; csp?: s
 <meta name="robots" content="noindex">
 <title>${title}</title>
 <style>${new Html(CSS)}</style>
+<script src="/assets/theme.js"></script>
 ${opts.head ?? ""}
 </head>
-<body><main>${body}</main></body>
+<body><main><div class="topbar"><a class="brand" href="/">gh-backup</a><span class="grow"></span><button type="button" class="ghost" data-theme-toggle title="Switch between light, dark and your system setting">Theme</button></div>${body}</main></body>
 </html>`;
 	return new Response(doc.value, {
 		status: opts.status ?? 200,
@@ -200,8 +213,9 @@ function filterState(repo: Repo, backedUp: boolean): string {
 	return repo.last_status === "error" ? "error" : "on";
 }
 
-function toggle(action: string, field: string, on: boolean, label: string): Html {
-	return html`<form method="post" action="${action}"><input type="hidden" name="${field}" value="${on ? "0" : "1"}"><button class="${on ? "on" : ""}" type="submit">${label}: ${on ? "on" : "off"}</button></form>`;
+/** A switch that posts its opposite value, so it works without any script. */
+function toggle(action: string, field: string, on: boolean, label: unknown, title = ""): Html {
+	return html`<form method="post" action="${action}"><input type="hidden" name="${field}" value="${on ? "0" : "1"}"><button class="switch ${on ? "on" : ""}" type="submit" role="switch" aria-checked="${on ? "true" : "false"}" title="${title}">${label}</button></form>`;
 }
 
 function accountTitle(account: Account): Html {
@@ -237,11 +251,7 @@ export function dashboardPage(d: DashboardData): Response {
 			const backedUp = isBackedUp(repo, account);
 			return html`<tr data-name="${repo.full_name.toLowerCase()}" data-state="${filterState(repo, backedUp)}">
 	<td class="name"><a class="link" href="/repos/${repo.id}">${repo.full_name}</a>${repo.private ? html`<span class="chip">private</span>` : ""}${repo.fork ? html`<span class="chip">fork</span>` : ""}${repo.archived ? html`<span class="chip">archived</span>` : ""}${repo.storage === "r2-bundle" ? html`<span class="chip" title="Too large for Artifacts; stored as a git bundle in R2">bundle</span>` : ""}</td>
-	<td><form method="post" action="/repos/${repo.id}/override"><select name="override" onchange="this.form.submit()" aria-label="Backup setting for ${repo.full_name}">
-		<option value="" ${repo.override === null ? new Html("selected") : ""}>Follow account (${isBackedUp({ ...repo, override: null }, account) ? "on" : "off"})</option>
-		<option value="1" ${repo.override === 1 ? new Html("selected") : ""}>Always back up</option>
-		<option value="0" ${repo.override === 0 ? new Html("selected") : ""}>Never back up</option>
-	</select></form></td>
+	<td>${repo.gone_at ? "" : toggle(`/repos/${repo.id}/override`, "override", backedUp, backedUp ? "On" : html`<span class="muted">Off</span>`, `Back up ${repo.full_name}`)}</td>
 	<td>${statusCell(repo, backedUp)}</td>
 	<td class="muted">${ago(repo.last_success_at)}</td>
 	<td class="muted">${bytes(repo.size_bytes === null ? null : repo.size_bytes + repo.lfs_bytes)}</td>
@@ -250,9 +260,23 @@ export function dashboardPage(d: DashboardData): Response {
 		return html`<div class="card" data-account>
 	<div class="row spread">
 		<div class="row">${accountTitle(account)}<span class="muted small">${repos.length} repos</span></div>
-		<div class="row">${toggle(base, "enabled", account.enabled === 1, "Back up")}${account.kind === "starred" ? "" : toggle(base, "include_forks", account.include_forks === 1, "Include forks")}</div>
+		<div class="row">
+			<form method="post" action="${base}"><input type="hidden" name="select" value="all"><button type="submit" title="Switch on every repository listed here${account.include_forks ? "" : " except forks"}">Back up all</button></form>
+			<form method="post" action="${base}"><input type="hidden" name="select" value="none"><button type="submit" title="Switch off every repository listed here. Existing backups are kept.">Stop all</button></form>
+		</div>
 	</div>
-	${repos.length ? html`<div class="scroll"><table><thead><tr><th>Repository</th><th>Backup</th><th>Status</th><th>Last success</th><th>Size</th></tr></thead><tbody>${rows}</tbody></table></div>` : html`<p class="muted small">${account.kind === "starred" ? "Switch this on to list and back up the public repositories you starred." : "No repositories visible to the app here."}</p>`}
+	<div class="auto">
+		${
+			account.kind === "starred"
+				? toggle(base, "auto_public", account.auto_public === 1, "Back up repositories I star", "Lists your public stars and backs up new ones automatically")
+				: html`<span class="label">Automatically import new repos</span>
+		${toggle(base, "auto_all", account.auto_public === 1 && account.auto_private === 1, "All", "New public and private repositories are backed up as soon as they appear")}
+		${toggle(base, "auto_public", account.auto_public === 1, "Public")}
+		${toggle(base, "auto_private", account.auto_private === 1, "Private")}
+		${toggle(base, "include_forks", account.include_forks === 1, "Include forks", "Whether automatic import and Back up all also take forks")}`
+		}
+	</div>
+	${repos.length ? html`<div class="scroll"><table><thead><tr><th>Repository</th><th>Backup</th><th>Status</th><th>Last success</th><th>Size</th></tr></thead><tbody>${rows}</tbody></table></div>` : html`<p class="muted small">${account.kind === "starred" ? "Switch on \"Back up repositories I star\" to list and back up your public stars." : "No repositories visible to the app here."}</p>`}
 </div>`;
 	});
 
@@ -331,7 +355,7 @@ ${repoTabs(repo, "overview", d.counts)}
 ${d.flash ? html`<div class="flash">${d.flash}</div>` : ""}
 ${repo.gone_at ? html`<div class="banner"><b class="warn">This repository has not been visible on GitHub since ${repo.gone_at}.</b><br>Its backup is frozen and kept until you delete it yourself.</div>` : ""}
 <div class="tiles">
-	<div class="tile"><b>${backedUp ? "on" : "off"}</b><span class="muted">backup${repo.override !== null ? " (override)" : ""}</span></div>
+	<div class="tile"><b>${backedUp ? "on" : "off"}</b><span class="muted">backup</span></div>
 	<div class="tile"><b>${ago(repo.last_success_at)}</b><span class="muted">last success</span></div>
 	<div class="tile"><b>${refs ? `${refs.heads} / ${refs.tags}` : "–"}</b><span class="muted">branches / tags</span></div>
 	<div class="tile"><b>${refs?.snapshots ?? "–"}</b><span class="muted">history snapshots kept</span></div>
@@ -353,7 +377,7 @@ ${repo.last_status === "error" ? html`<div class="banner"><b class="bad">Last sy
 	}
 	<h3>Where the rest is stored (R2 bucket)</h3>
 	<ul class="small">
-		<li>Issues, pull requests, reviews, comments, labels, milestones, releases and release assets: <code>${metaPrefix(repo.full_name)}</code></li>
+		<li>Issues, pull requests, reviews, comments, labels, milestones, releases and release assets: <code>${metaPrefix(repo)}</code></li>
 		<li>LFS objects: <code>lfs/&lt;first two hex chars&gt;/&lt;oid&gt;</code>, listed per repo in <code>lfs-manifests/${repo.id}.json</code></li>
 	</ul>
 </div>

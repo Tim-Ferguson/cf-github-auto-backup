@@ -5,12 +5,27 @@ const API = "https://api.github.com";
 const USER_AGENT = "gh-backup (self-hosted Cloudflare Worker)";
 
 export class GitHubError extends Error {
+	/** When a rate-limited request may be tried again (ms since epoch), else null. */
+	retryAt: number | null = null;
+
 	constructor(
 		public status: number,
 		public path: string,
 		body: string,
+		headers?: Headers,
 	) {
 		super(`GitHub ${status} for ${path}: ${body.slice(0, 300)}`);
+		// GitHub answers rate limits with 403 or 429. That must never be read
+		// as "this resource does not exist".
+		if ((status === 403 || status === 429) && headers) {
+			const retryAfter = Number(headers.get("retry-after"));
+			const reset = Number(headers.get("x-ratelimit-reset")) * 1000;
+			if (retryAfter > 0 || headers.get("x-ratelimit-remaining") === "0" || status === 429 || /rate limit|abuse detection/i.test(body)) {
+				const now = Date.now();
+				const at = retryAfter > 0 ? now + retryAfter * 1000 : reset > now ? reset + 5000 : now + 60_000;
+				this.retryAt = Math.min(at, now + 65 * 60_000);
+			}
+		}
 	}
 }
 
@@ -30,6 +45,8 @@ export interface AppConfig {
  */
 export interface Deployment {
 	owner: string;
+	/** GitHub's numeric id for the owner; null on deployments set up before it was recorded. */
+	ownerId: number | null;
 	app: AppConfig | null;
 	token: string | null;
 }
@@ -43,7 +60,7 @@ export async function loadDeployment(db: D1Database): Promise<Deployment | null>
 			: null;
 	const token = c.github_token ?? null;
 	if (!app && !token) return null;
-	return { owner: c.owner, app, token };
+	return { owner: c.owner, ownerId: c.owner_id ? Number(c.owner_id) : null, app, token };
 }
 
 /** Token for reading one account's repositories; null means anonymous. */
@@ -63,7 +80,7 @@ export function ghFetch(token: string | null, pathOrUrl: string, init: RequestIn
 
 export async function gh<T>(token: string | null, path: string, init: RequestInit = {}): Promise<T> {
 	const res = await ghFetch(token, path, init);
-	if (!res.ok) throw new GitHubError(res.status, path, await res.text());
+	if (!res.ok) throw new GitHubError(res.status, path, await res.text(), res.headers);
 	return res.json<T>();
 }
 
@@ -74,7 +91,7 @@ function nextLink(res: Response): string | null {
 /** One page of a list endpoint plus the URL of the next page, if any. */
 export async function ghPage<T>(token: string | null, pathOrUrl: string): Promise<{ items: T[]; next: string | null }> {
 	const res = await ghFetch(token, pathOrUrl);
-	if (!res.ok) throw new GitHubError(res.status, pathOrUrl, await res.text());
+	if (!res.ok) throw new GitHubError(res.status, pathOrUrl, await res.text(), res.headers);
 	const body = await res.json<T[] | Record<string, unknown>>();
 	// Some endpoints wrap the list: { total_count, repositories: [...] }.
 	const items = Array.isArray(body) ? body : ((Object.values(body).find(Array.isArray) as T[] | undefined) ?? []);
@@ -104,7 +121,7 @@ export function gitBasicAuth(token: string): string {
 
 export interface GhInstallation {
 	id: number;
-	account: { login: string; type: "User" | "Organization" };
+	account: { id: number; login: string; type: "User" | "Organization" };
 	suspended_at: string | null;
 }
 
@@ -117,5 +134,5 @@ export interface GhRepo {
 	has_wiki: boolean;
 	default_branch: string;
 	pushed_at: string | null;
-	owner: { login: string; type: "User" | "Organization" };
+	owner: { id: number; login: string; type: "User" | "Organization" };
 }

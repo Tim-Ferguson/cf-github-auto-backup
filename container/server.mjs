@@ -1,11 +1,15 @@
 // HTTP front for syncRepo. Only the GitRunner Durable Object can reach this
 // server, so there is no auth here. One job at a time per container.
 
-import { createReadStream } from "node:fs";
+import { createReadStream, createWriteStream, existsSync } from "node:fs";
+import { rm } from "node:fs/promises";
+import { pipeline } from "node:stream/promises";
 import { createServer } from "node:http";
 import { syncRepo } from "./sync.mjs";
 
 const WORKDIR = process.env.WORKDIR ?? "/work";
+// Outside WORKDIR, which every sync wipes before it starts.
+const SEED = `${WORKDIR}.seed.bundle`;
 
 /** @type {{ id: string, state: "running" | "done" | "error", phase: string, result?: any, error?: { code: string, message: string } } | null} */
 let job = null;
@@ -34,6 +38,13 @@ function sendFile(req, res, file, type) {
 const server = createServer(async (req, res) => {
 	try {
 		const { pathname } = new URL(req.url, "http://container");
+		if (req.method === "POST" && pathname === "/seed") {
+			// The existing backup of a repo too large for Artifacts, as a bundle.
+			if (job?.state === "running" && job.id !== req.headers["x-job-id"]) return json(res, 409, { error: "busy" });
+			if (job?.state === "running") return json(res, 200, { ok: true });
+			await pipeline(req, createWriteStream(SEED));
+			return json(res, 200, { ok: true });
+		}
 		if (req.method === "POST" && pathname === "/sync") {
 			const body = await readJson(req);
 			if (job?.state === "running") {
@@ -41,16 +52,19 @@ const server = createServer(async (req, res) => {
 				return job.id === body.id ? json(res, 202, { id: job.id }) : json(res, 409, { error: "busy" });
 			}
 			const current = (job = { id: body.id, state: "running", phase: "starting" });
-			syncRepo(body, { workdir: WORKDIR, onPhase: (phase) => (current.phase = phase) }).then(
-				(result) => Object.assign(current, { state: "done", result }),
-				(err) => Object.assign(current, { state: "error", error: { code: err.code ?? "INTERNAL", message: String(err.message ?? err) } }),
-			);
+			const seedBundle = body.seeded && existsSync(SEED) ? SEED : undefined;
+			syncRepo(body, { workdir: WORKDIR, onPhase: (phase) => (current.phase = phase), seedBundle })
+				.then(
+					(result) => Object.assign(current, { state: "done", result }),
+					(err) => Object.assign(current, { state: "error", error: { code: err.code ?? "INTERNAL", message: String(err.message ?? err) } }),
+				)
+				.finally(() => rm(SEED, { force: true }));
 			return json(res, 202, { id: body.id });
 		}
 		if (req.method === "GET" && pathname === "/status") {
 			if (!job) return json(res, 200, { state: "idle" });
 			const { id, state, phase, result, error } = job;
-			return json(res, 200, { id, state, phase, error, result: result && { ...result, bundle: result.bundle && { size: result.bundle.size }, lfs: { count: result.lfs.count, bytes: result.lfs.bytes } } });
+			return json(res, 200, { id, state, phase, error, result: result && { ...result, bundle: result.bundle && { size: result.bundle.size }, lfs: { count: result.lfs.count, bytes: result.lfs.bytes, size: result.lfs.size } } });
 		}
 		if (req.method === "GET" && pathname === "/lfs.json") {
 			return sendFile(req, res, job?.result?.lfs, "application/json");

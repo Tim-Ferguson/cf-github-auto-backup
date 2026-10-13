@@ -13,9 +13,9 @@ If GitHub suspends your account tomorrow, you still have every branch, tag, pull
 | Full git history: all branches, tags and pull request heads | [Cloudflare Artifacts](https://developers.cloudflare.com/artifacts/), one repo per GitHub repo |
 | Wikis | Artifacts, as `<repo>.wiki` |
 | Git LFS objects (all history, not just current files) | R2, content-addressed under `lfs/` |
-| Issues, pull requests, reviews, comments, labels, milestones | R2, one JSON file per item under `meta/<owner>/<repo>/` |
+| Issues, pull requests, reviews, comments, labels, milestones | R2, one JSON file per item under `meta/<repo id>/` |
 | Releases and their downloadable assets | R2, same prefix |
-| Repos too big for Artifacts (over 1 GB, or any file over 32 MB) | R2, as complete `git bundle` files (newest 3 kept) |
+| Repos too big for Artifacts (over 1 GB, or any file over 32 MB) | R2, as complete `git bundle` files (newest 3 kept; each carries the kept snapshots of the one before) |
 
 ## It never mirrors destruction
 
@@ -36,7 +36,7 @@ Every repository in the dashboard has a **Browse code** view that reads straight
 - READMEs and other Markdown files rendered, with relative links and images pointing at the backed-up files.
 - Commit history per branch, and browsing the tree as of any commit.
 
-Highlighting runs in your browser from a script served by your own Worker, so no third party sees what you open. Repositories stored as bundles (too large for Artifacts) cannot be browsed.
+Highlighting runs in your browser from a script served by your own Worker. The one thing that can reach a third party is an image a README or issue links to on another site: your browser loads it from there, as it would on GitHub. Repositories stored as bundles (too large for Artifacts) cannot be browsed.
 
 The rest of the backup is browsable too, from tabs on each repository:
 
@@ -48,11 +48,15 @@ The dashboard has a filter box (press `/`) and quick filters for backed up, fail
 
 ## Choosing what to back up
 
-Out of the box only your own non-fork repositories are backed up. Everything else is a toggle in the dashboard:
+Every repository has its own on/off switch in the dashboard. What a repository starts out as is decided once, when it is first discovered, by its account's settings:
 
-- **Per account and per organization**: "Back up" on/off and "Include forks" on/off, set separately for each one.
-- **Per repository**: "Follow account", "Always back up" or "Never back up". This is how you back up one fork or one org repo without taking the rest.
-- **Starred repositories**: one switch, off by default. Public repos only, git history only.
+- **Automatically import new repos**: *All*, or *Public* and *Private* separately. When on, a repository that appears later is backed up without you doing anything. When off, it is listed and waits for you to switch it on.
+- **Include forks**: whether automatic import also takes forks.
+- **Back up all** / **Stop all**: switch every repository the account has right now. Stopping keeps the existing backups.
+
+These are set per account and per organization. Out of the box your own account imports everything except forks, and every other account or organization imports nothing until you say so. **Starred repositories** have one switch: public repos only, git history only.
+
+The dashboard follows your system's light or dark setting; the **Theme** button in the top corner overrides it.
 
 ## Requirements
 
@@ -125,7 +129,7 @@ A token is stored in your D1 database. You can start with a token and switch to 
 ```sh
 npm run cli                    # interactive menu
 npm run cli -- status          # what is backed up, what is failing
-npm run cli -- accounts        # toggle accounts, orgs, forks, single repos
+npm run cli -- accounts        # auto-import settings per account, and single repos on or off
 npm run cli -- sync [repo]     # sync everything, or one repo
 npm run cli -- discover        # refresh the repo list from GitHub
 npm run cli -- clone [repo]    # print a ready-to-paste clone command
@@ -140,8 +144,8 @@ To drive a deployment from another machine or from CI, set `GH_BACKUP_URL` and `
 
 ```sh
 cf auth login
-echo 'ADMIN_PASSWORD=<at least 12 characters>' > secrets.env
-cf deploy --secrets-file secrets.env && rm secrets.env
+echo 'ADMIN_PASSWORD=<at least 12 characters>' > .env.deploy    # git-ignored
+cf deploy --secrets-file .env.deploy; rm .env.deploy
 ```
 
 Then open the Worker URL, sign in with the password and click **Create the GitHub App**. To add an organization later, use **Add account or org** in the dashboard, then switch that organization on.
@@ -185,9 +189,11 @@ It creates the repository, then pushes or recreates:
 - pull requests as closed issues titled `[PR] …`, holding the description, reviews and review comments
 - releases and their assets
 
-Options: `--to owner/name`, `--private` or `--public`, `--skip-issues`, `--skip-releases`, `--yes`.
+Options: `--to owner/name`, `--private` or `--public`, `--skip-issues`, `--skip-releases`, `--resume` (continue an interrupted restore into the same repository), `--yes`.
 
-What GitHub cannot take back: restored items are authored by you (original authors and dates are written into each one, without @-mentioning anyone), pull requests are not real pull requests, and stars, reactions, milestones, assignees, settings, secrets, webhooks and Actions history are not restored. Issue restore is slow on purpose, about a second per item, because GitHub throttles bulk creation.
+Kept snapshots hold history that was deliberately rewritten or deleted, which is often how a leaked secret was removed. They are restored to private repositories, and left out of public ones unless you add `--include-snapshots`.
+
+What GitHub cannot take back: restored items are authored by you (original authors and dates are written into each one, without @-mentioning anyone), pull requests are not real pull requests, and stars, reactions, milestones, assignees, settings, secrets, webhooks and Actions history are not restored. Issue restore is slow on purpose: GitHub allows roughly 500 created items an hour, so the CLI paces itself and pauses when it nears that.
 
 ### By hand
 
@@ -208,7 +214,7 @@ git push --mirror <new remote>
 
 Everything else is plain files in the R2 bucket `gh-backup-data`:
 
-- `meta/<owner>/<repo>/issues/<number>.json` and friends are the raw GitHub API objects.
+- `meta/<repo id>/issues/<number>.json` and friends are the raw GitHub API objects. (Backups first made before storage was keyed by id stay under `meta/<owner>/<repo>/`.) The dashboard's repository page shows the exact location.
 - `lfs-manifests/<repo id>.json` lists a repo's LFS objects; each one is at `lfs/<first two hex chars>/<oid>`. To restore, copy them into `.git/lfs/objects/<aa>/<bb>/<oid>` of a clone and run `git lfs checkout`.
 - `bundles/<repo id>/<timestamp>.bundle` restores with `git clone --mirror <file>`.
 
@@ -216,7 +222,10 @@ Everything else is plain files in the R2 bucket `gh-backup-data`:
 
 - The GitHub App is read-only and its private key lives in your D1 database, inside your Cloudflare account.
 - The dashboard, the setup page and the `/api/*` endpoints all require the `ADMIN_PASSWORD` secret; the GitHub account that created the app can also sign in with GitHub. Keep `.gh-backup.json` private.
-- Wrong passwords are rate limited: 5 per address in 15 minutes, and 300 an hour across all addresses, for both the sign-in form and the API. A sustained attack can therefore pause password sign-in for everyone until it stops; sign-in with GitHub keeps working.
+- Wrong passwords are rate limited: 5 per address in 15 minutes, and 300 an hour across all addresses, for both the sign-in form and the API. A sustained attack can therefore pause password sign-in and the CLI for everyone until it stops; sign-in with GitHub keeps working.
+- Changing `ADMIN_PASSWORD` signs out every existing session.
+- The owner and every account are tracked by GitHub's numeric id, not by name, so a renamed or re-registered username cannot inherit access or settings.
+- Each backup is stored under the repository's id, so a new repository that reuses an old name gets its own backup.
 - In token mode the GitHub token sits in D1 in plain text and may carry write access. Prefer the GitHub App, or a fine-grained read-only token.
 - The app is created as *public* because GitHub only allows private apps to be installed on the account that owns them, which would rule out organizations. If a stranger installs it, their account appears in your dashboard switched off and nothing of theirs is backed up unless you turn it on.
 - To start over, delete the rows in the `config` table (`cf d1 query <database id> --sql "DELETE FROM config"`) and delete the app on GitHub.
@@ -247,6 +256,8 @@ One real run, on one personal account, set up with the CLI and a GitHub App:
 - **Every ref verified**: all 100 branches and 55 pull request heads (`refs/pull/*`) in Artifacts were compared with GitHub and matched.
 - **Restore**: a repository cloned back from Cloudflare with the dashboard's clone command was complete and matched GitHub.
 - **Metadata**: issues, pull requests, comments and labels were written to R2.
+- **A code review's fixes** (see the commit history): the live deployment was migrated in place with all 60 repositories still on, none marked gone, and syncs succeeding afterwards. The rate limiter held against 50 simultaneous guesses in a local test. The bundle-seeding fix is covered by a local test only.
+- **Theme toggle, per-repository switches and auto-import settings**: checked in headless Chrome against the live deployment.
 - **Changing the address**: `move` redeployed a live instance under a new name with all 60 backups intact, removed the old Worker, re-pointed the GitHub webhook, and a full sync then succeeded on the new one.
 - **Sign-in rate limit** (tested locally, since testing it live would lock out the tester): the sixth wrong password from an address is refused for 15 minutes, other addresses are unaffected, and a correct password resets the count.
 - **Dashboard filter**: search and the status filters, checked in headless Chrome.

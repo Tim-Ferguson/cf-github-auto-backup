@@ -2,9 +2,9 @@ import { WorkflowEntrypoint, type WorkflowEvent, type WorkflowStep } from "cloud
 import { NonRetryableError } from "cloudflare:workflows";
 import { ensureSchema, getAccount, getRepo, isBackedUp, type Repo, STARRED, updateRepo } from "./db.ts";
 import { gitBasicAuth, loadDeployment, tokenFor } from "./github.ts";
-import { META_VERSION, regroupFlatComments, RESOURCES, syncMetadataPage } from "./metadata.ts";
+import { META_VERSION, type PageResult, regroupFlatComments, RESOURCES, syncMetadataPage } from "./metadata.ts";
 import { type GitRunner, runnerFor } from "./runner.ts";
-import { copyLfsObjects, type LfsObject, lfsManifestKey, pruneBundles, putRanged, putStream } from "./storage.ts";
+import { copyLfsObjects, latestBundle, type LfsObject, lfsManifestKey, metaPrefix, pruneBundles, putRanged, putStream } from "./storage.ts";
 
 export interface BackupParams {
 	repoId: number;
@@ -22,9 +22,13 @@ const MAX_REPO_BYTES = 1024 ** 3;
 const MAX_POLLS = 250;
 const pollSeconds = (i: number) => (i < 6 ? 5 : i < 30 ? 15 : 60);
 const LFS_BATCH = 20;
-const RUNNING_GRACE_MS = 60 * 60 * 1000;
+// Longer than the longest sync the poll loop allows, so a second sync cannot
+// start while the first may still be using the container.
+const RUNNING_GRACE_MS = 5 * 60 * 60 * 1000;
 const BUSY = "another sync of this repository is still running";
 const ARTIFACTS_TOKEN_TTL = 6 * 60 * 60;
+const MAX_META_PAGES = 2000;
+const MAX_RATE_LIMIT_WAITS = 8;
 
 interface GitResult {
 	refs: { heads: number; tags: number; pulls: number; snapshots: number };
@@ -35,7 +39,7 @@ interface GitResult {
 	sizeBytes: number;
 	oversize: string | null;
 	bundle: { size: number } | null;
-	lfs: { count: number; bytes: number };
+	lfs: { count: number; bytes: number; size: number };
 }
 
 interface RunnerStatus {
@@ -56,12 +60,19 @@ interface GitJob {
 	pulls: boolean;
 	/** Missing sources are expected for wikis that were never created. */
 	optional: boolean;
+	/** R2 key of a bundle that holds the existing backup, for repos too large for Artifacts. */
+	seedBundle: string | null;
 }
 
-/** Artifacts names allow letters, digits, dots, underscores and hyphens. */
+/**
+ * Artifacts names allow letters, digits, dots, underscores and hyphens. The
+ * repo id is part of the name because `owner/repo` can be renamed and later
+ * reused by a different repository, which must not share a backup.
+ */
 export function artifactsName(repo: Pick<Repo, "id" | "full_name">): string {
 	const name = repo.full_name.replace("/", "--").replace(/[^A-Za-z0-9._-]/g, "-");
-	return name.length <= 56 ? name : `${name.slice(0, 44)}-${repo.id}`;
+	const suffix = `-${repo.id}`;
+	return name.slice(0, 50 - suffix.length) + suffix;
 }
 
 const cursorNow = () => new Date().toISOString().slice(0, 19) + "Z";
@@ -77,27 +88,37 @@ export class BackupWorkflow extends WorkflowEntrypoint<Env, BackupParams> {
 			if (!repo) return null;
 			const account = await getAccount(env.DB, repo.account);
 			if (!force && !isBackedUp(repo, account ?? undefined)) return null;
-			// Two syncs of one repo would fight over the same container.
-			if (repo.last_status === "running" && repo.last_run_at && Date.now() - Date.parse(repo.last_run_at) < RUNNING_GRACE_MS) return null;
-			const startedAt = cursorNow();
+			// Two syncs of one repo would fight over the same container. A retry
+			// of this very step is recognised by its instance id and carries on.
+			const mine = repo.run_instance === event.instanceId;
+			if (!mine && repo.last_status === "running" && repo.last_run_at && Date.now() - Date.parse(repo.last_run_at) < RUNNING_GRACE_MS) return null;
+
+			const startedAt = mine && repo.last_run_at ? repo.last_run_at : cursorNow();
 			const name = repo.artifacts_name ?? artifactsName(repo);
-			await updateRepo(env.DB, repoId, { last_status: "running", last_run_at: startedAt, artifacts_name: name });
-			const run = await env.DB.prepare(`INSERT INTO runs (repo_id, trigger, started_at, status) VALUES (?, ?, ?, 'running') RETURNING id`)
-				.bind(repoId, trigger, startedAt)
-				.first<{ id: number }>();
+			const prefix = metaPrefix(repo);
+			// Clearing `dirty` here means: every push up to now is covered by the
+			// fetch this run is about to do. A push after this sets it again.
+			await updateRepo(env.DB, repoId, { last_status: "running", last_run_at: startedAt, artifacts_name: name, meta_prefix: prefix, run_instance: event.instanceId, dirty: 0 });
+			const existing = mine ? await env.DB.prepare(`SELECT id FROM runs WHERE repo_id = ? AND started_at = ? AND status = 'running'`).bind(repoId, startedAt).first<{ id: number }>() : null;
+			const run =
+				existing ??
+				(await env.DB.prepare(`INSERT INTO runs (repo_id, trigger, started_at, status) VALUES (?, ?, ?, 'running') RETURNING id`).bind(repoId, trigger, startedAt).first<{ id: number }>());
 			return {
 				runId: run!.id,
 				startedAt,
 				fullName: repo.full_name,
 				artifactsName: name,
+				metaPrefix: prefix,
 				defaultBranch: repo.default_branch,
 				hasWiki: repo.has_wiki === 1,
 				starred: repo.account === STARRED,
 				pushedAt: repo.pushed_at,
+				bundled: repo.storage === "r2-bundle",
 				// An older metadata layout gets one full resync instead of an incremental one.
 				metaCursor: repo.meta_version < META_VERSION ? null : repo.meta_cursor,
+				previousCursor: repo.meta_cursor,
 				metaUpgrade: repo.meta_version < META_VERSION && repo.meta_cursor !== null,
-				gitCurrent: !force && repo.storage !== null && repo.pushed_at === repo.synced_pushed_at,
+				gitCurrent: !force && repo.dirty === 0 && repo.storage !== null && repo.pushed_at === repo.synced_pushed_at,
 			};
 		});
 		if (!plan) return { skipped: true };
@@ -115,10 +136,15 @@ export class BackupWorkflow extends WorkflowEntrypoint<Env, BackupParams> {
 
 		const detail: Record<string, unknown> = {};
 		try {
+			let git: GitResult | null = null;
 			if (plan.gitCurrent) {
 				detail.git = "unchanged";
 			} else {
-				const git = await this.gitJob(step, runner, sourceToken, {
+				// A repo too large for Artifacts has its history in the newest
+				// bundle. Starting from it lets the container keep force-pushed
+				// and deleted refs, exactly as it does for Artifacts-backed repos.
+				const seedBundle = plan.bundled ? await step.do("git: find bundle", async () => latestBundle(env.BUCKET, repoId)) : null;
+				git = await this.gitJob(step, runner, sourceToken, {
 					label: "git",
 					jobId: `${event.instanceId}-git`,
 					sourcePath: plan.fullName,
@@ -127,12 +153,14 @@ export class BackupWorkflow extends WorkflowEntrypoint<Env, BackupParams> {
 					defaultBranch: plan.defaultBranch,
 					pulls: true,
 					optional: false,
+					seedBundle,
 				});
 				if (!git) throw new NonRetryableError("git sync returned no result");
 				detail.git = git;
+				const result = git;
 
-				if (git.bundle) {
-					const size = git.bundle.size;
+				if (result.bundle) {
+					const size = result.bundle.size;
 					await step.do("bundle: upload", { timeout: "3 hours", retries: { limit: 2, delay: "1 minute" } }, async () => {
 						const key = `bundles/${repoId}/${plan.startedAt.replace(/[-:]/g, "")}.bundle`;
 						await putRanged(env.BUCKET, key, size, async (start, end) => {
@@ -140,36 +168,55 @@ export class BackupWorkflow extends WorkflowEntrypoint<Env, BackupParams> {
 							if (!res.ok || !res.body) throw new Error(`bundle download failed: ${res.status}`);
 							return res.body;
 						});
+						// Each bundle now carries every kept snapshot from the one
+						// before it, so older bundles can go.
 						await pruneBundles(env.BUCKET, repoId);
 					});
 				}
 
-				if (git.lfs.count > 0) {
+				// The git data is safe at this point; say so before anything else can fail.
+				await step.do("git: record", async () => {
+					await updateRepo(env.DB, repoId, {
+						storage: result.oversize ? "r2-bundle" : "artifacts",
+						size_bytes: result.sizeBytes,
+						ref_counts: JSON.stringify(result.refs),
+						lfs_count: result.lfs.count,
+						lfs_bytes: result.lfs.bytes,
+					});
+				});
+
+				if (result.lfs.count > 0) {
 					await step.do("lfs: manifest", async () => {
 						const res = await runner().fetch("http://runner/lfs.json");
 						if (!res.ok || !res.body) throw new Error(`LFS manifest download failed: ${res.status}`);
-						await putStream(env.BUCKET, lfsManifestKey(repoId), res.body, Number(res.headers.get("content-length")));
+						await putStream(env.BUCKET, lfsManifestKey(repoId), res.body, result.lfs.size);
 					});
 				}
+			}
 
-				if (plan.hasWiki) {
-					const wiki = await this.gitJob(step, runner, sourceToken, {
-						label: "wiki",
-						jobId: `${event.instanceId}-wiki`,
-						sourcePath: `${plan.fullName}.wiki`,
-						artifactsName: `${plan.artifactsName}.wiki`,
-						description: `Backup of the github.com/${plan.fullName} wiki`,
-						defaultBranch: null,
-						pulls: false,
-						optional: true,
-					});
-					if (wiki) detail.wiki = { refs: wiki.refs, sizeBytes: wiki.sizeBytes, newSnapshots: wiki.newSnapshots };
-				}
-
-				await step.do("runner: stop", async () => {
-					await runner().destroy().catch(() => {});
+			// The wiki is checked on every run: editing it does not count as a
+			// push to the repository, so it cannot ride on the git step.
+			if (plan.hasWiki) {
+				const wiki = await this.gitJob(step, runner, sourceToken, {
+					label: "wiki",
+					jobId: `${event.instanceId}-wiki`,
+					sourcePath: `${plan.fullName}.wiki`,
+					artifactsName: `${plan.artifactsName}.wiki`,
+					description: `Backup of the github.com/${plan.fullName} wiki`,
+					defaultBranch: null,
+					pulls: false,
+					optional: true,
+					seedBundle: null,
 				});
+				if (wiki?.oversize) throw new NonRetryableError(`the wiki is too large for Artifacts and was not backed up: ${wiki.oversize}`);
+				if (wiki) detail.wiki = { refs: wiki.refs, sizeBytes: wiki.sizeBytes, newSnapshots: wiki.newSnapshots };
+			}
 
+			await step.do("runner: stop", async () => {
+				await runner().destroy().catch(() => {});
+			});
+
+			if (git && git.lfs.count > 0) {
 				let copied = 0;
 				let missing = 0;
 				for (let offset = 0; offset < git.lfs.count; offset += LFS_BATCH) {
@@ -183,40 +230,43 @@ export class BackupWorkflow extends WorkflowEntrypoint<Env, BackupParams> {
 					copied += res.copied;
 					missing += res.missing;
 				}
-				if (git.lfs.count > 0) detail.lfs = { objects: git.lfs.count, bytes: git.lfs.bytes, copied, missing };
-
-				await step.do("git: record", async () => {
-					await updateRepo(env.DB, repoId, {
-						storage: git.oversize ? "r2-bundle" : "artifacts",
-						size_bytes: git.sizeBytes,
-						ref_counts: JSON.stringify(git.refs),
-						lfs_count: git.lfs.count,
-						lfs_bytes: git.lfs.bytes,
-					});
-				});
+				detail.lfs = { objects: git.lfs.count, bytes: git.lfs.bytes, copied, missing };
 			}
 
 			// Metadata of starred repos is skipped: popular projects have
 			// hundreds of thousands of issues that are not yours to lose.
+			let metaComplete = true;
 			if (!plan.starred) {
 				const stored: Record<string, number> = {};
 				if (plan.metaUpgrade) {
-					await step.do("meta: upgrade layout", async () => regroupFlatComments(env.BUCKET, plan.fullName));
+					await step.do("meta: upgrade layout", async () => regroupFlatComments(env.BUCKET, plan.metaPrefix));
 				}
 				for (const resource of RESOURCES) {
 					let url: string | null = null;
-					for (let page = 0; page < 2000; page++) {
-						const res: { next: string | null; stored: number } = await step.do(
-							`meta: ${resource.name} ${page}`,
+					let waits = 0;
+					for (let page = 0; ; ) {
+						const res: PageResult = await step.do(
+							`meta: ${resource.name} ${page}${waits ? ` (attempt ${waits + 1})` : ""}`,
 							{ timeout: "30 minutes", retries: { limit: 4, delay: "30 seconds", backoff: "exponential" } },
-							async () => syncMetadataPage(env.BUCKET, await sourceToken(), plan.fullName, resource, url, plan.metaCursor, { db: env.DB, repoId }),
+							async () => syncMetadataPage(env.BUCKET, await sourceToken(), plan.fullName, plan.metaPrefix, resource, url, plan.metaCursor, { db: env.DB, repoId }),
 						);
+						if (res.retryAt) {
+							// Rate limited: wait for GitHub's reset and ask for the same page again.
+							if (++waits > MAX_RATE_LIMIT_WAITS) throw new Error(`GitHub kept rate-limiting ${resource.name}; the next run continues from the same point`);
+							await step.sleepUntil(`meta: ${resource.name} ${page} wait ${waits}`, new Date(res.retryAt));
+							continue;
+						}
 						stored[resource.name] = (stored[resource.name] ?? 0) + res.stored;
 						url = res.next;
 						if (!url) break;
+						if (++page >= MAX_META_PAGES) {
+							metaComplete = false;
+							break;
+						}
 					}
 				}
 				detail.metadata = stored;
+				if (!metaComplete) detail.metadataIncomplete = `more than ${MAX_META_PAGES} pages of one kind; the rest is fetched on later runs`;
 			}
 
 			await step.do("finish", async () => {
@@ -226,12 +276,19 @@ export class BackupWorkflow extends WorkflowEntrypoint<Env, BackupParams> {
 					last_error: null,
 					last_success_at: now,
 					synced_pushed_at: plan.pushedAt,
-					meta_cursor: plan.starred ? null : plan.startedAt,
-					meta_version: META_VERSION,
+					// The cursor only moves when everything up to it was really fetched.
+					meta_cursor: plan.starred ? null : metaComplete ? plan.startedAt : plan.previousCursor,
+					...(metaComplete ? { meta_version: META_VERSION } : {}),
+					run_instance: null,
 				});
 				await env.DB.prepare(`UPDATE runs SET status = 'ok', finished_at = ?, detail = ? WHERE id = ?`).bind(now, JSON.stringify(detail), plan.runId).run();
 				// Keep the run log bounded.
 				await env.DB.prepare(`DELETE FROM runs WHERE repo_id = ? AND id NOT IN (SELECT id FROM runs WHERE repo_id = ? ORDER BY id DESC LIMIT 50)`).bind(repoId, repoId).run();
+				// A push that arrived while this run was fetching is not in it. Go again.
+				const after = await getRepo(env.DB, repoId);
+				if (after?.dirty) {
+					await env.BACKUP_WORKFLOW.create({ id: `repo-${repoId}-${Date.now()}`, params: { repoId, trigger: "push", force: true } satisfies BackupParams });
+				}
 			});
 			return detail;
 		} catch (err) {
@@ -247,7 +304,7 @@ export class BackupWorkflow extends WorkflowEntrypoint<Env, BackupParams> {
 			}
 			await step.do("record failure", async () => {
 				const now = cursorNow();
-				await updateRepo(env.DB, repoId, { last_status: "error", last_error: message.slice(0, 2000) });
+				await updateRepo(env.DB, repoId, { last_status: "error", last_error: message.slice(0, 2000), run_instance: null });
 				await env.DB.prepare(`UPDATE runs SET status = 'error', finished_at = ?, detail = ? WHERE id = ?`)
 					.bind(now, JSON.stringify({ ...detail, error: message.slice(0, 2000) }), plan.runId)
 					.run();
@@ -267,7 +324,7 @@ export class BackupWorkflow extends WorkflowEntrypoint<Env, BackupParams> {
 		const env = this.env;
 		const sourceUrl = `https://github.com/${job.sourcePath}.git`;
 
-		const started = await step.do(`${job.label}: start`, { timeout: "10 minutes", retries: { limit: 3, delay: "20 seconds", backoff: "exponential" } }, async () => {
+		const started = await step.do(`${job.label}: start`, { timeout: "2 hours", retries: { limit: 3, delay: "20 seconds", backoff: "exponential" } }, async () => {
 			const token = await sourceToken();
 			const authHeader = token ? gitBasicAuth(token) : undefined;
 			if (job.optional) {
@@ -296,6 +353,14 @@ export class BackupWorkflow extends WorkflowEntrypoint<Env, BackupParams> {
 				repo[Symbol.dispose]();
 			}
 
+			if (job.seedBundle) {
+				const bundle = await env.BUCKET.get(job.seedBundle);
+				if (!bundle) throw new Error(`bundle ${job.seedBundle} is missing`);
+				const seeded = await runner().fetch("http://runner/seed", { method: "POST", headers: { "x-job-id": job.jobId }, body: bundle.body });
+				if (seeded.status === 409) throw new NonRetryableError(BUSY);
+				if (!seeded.ok) throw new Error(`runner refused the bundle: ${seeded.status} ${await seeded.text()}`);
+			}
+
 			const res = await runner().fetch("http://runner/sync", {
 				method: "POST",
 				headers: { "content-type": "application/json" },
@@ -304,6 +369,7 @@ export class BackupWorkflow extends WorkflowEntrypoint<Env, BackupParams> {
 					source: { url: sourceUrl, authHeader, pulls: job.pulls },
 					target: { url: remote, authHeader: `Bearer ${targetToken}` },
 					limits: { maxBlobBytes: MAX_BLOB_BYTES, maxRepoBytes: MAX_REPO_BYTES },
+					seeded: !!job.seedBundle,
 				}),
 			});
 			if (res.status === 409) throw new NonRetryableError(BUSY);

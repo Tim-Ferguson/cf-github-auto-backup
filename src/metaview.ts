@@ -116,7 +116,7 @@ function stateChip(state: string) {
 
 export async function handleMeta(env: Env, url: URL, repo: Repo, section: "issues" | "pulls" | "releases" | "asset", rest: string[]): Promise<Response> {
 	const base = `/repos/${repo.id}`;
-	const prefix = metaPrefix(repo.full_name);
+	const prefix = metaPrefix(repo);
 	const counts = await metaCounts(env.DB, repo.id);
 	const markdown = (text: string | null | undefined) =>
 		text ? html`<article class="md">${raw(renderMarkdown(text, { dir: "", fileUrl: (p) => `${base}/blob?path=${encodeURIComponent(p)}`, rawUrl: (p) => `${base}/raw?path=${encodeURIComponent(p)}` }))}</article>` : html`<p class="muted">No description.</p>`;

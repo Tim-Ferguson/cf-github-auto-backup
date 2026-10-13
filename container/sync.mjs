@@ -12,7 +12,8 @@ import { createInterface } from "node:readline";
 export const SNAPSHOT_PREFIX = "refs/backup/";
 const LIVE_PREFIXES = ["refs/heads/", "refs/tags/", "refs/pull/"];
 const LFS_POINTER_MAX = 1024;
-const LFS_POINTER_RE = /^version https:\/\/git-lfs\.github\.com\/spec\/v1\n(?:[a-z0-9.-]+ [^\n]*\n)*?oid sha256:([0-9a-f]{64})\nsize (\d+)\n/;
+// Pointer files committed from Windows can carry CRLF line endings.
+const LFS_POINTER_RE = /^version https:\/\/git-lfs\.github\.com\/spec\/v1\r?\n(?:[a-z0-9.-]+ [^\n]*\n)*?oid sha256:([0-9a-f]{64})\r?\nsize (\d+)\r?\n/;
 
 export class SyncError extends Error {
 	constructor(code, message) {
@@ -90,9 +91,12 @@ const stamp = (date) => date.toISOString().replace(/[-:]|\.\d+/g, "");
  *   limits?: { maxBlobBytes?: number, maxRepoBytes?: number },
  *   lfs?: boolean,
  * }}
- * @param opts {{ workdir: string, onPhase?: (phase: string) => void, now?: Date }}
+ * @param opts {{ workdir: string, onPhase?: (phase: string) => void, now?: Date, seedBundle?: string }}
+ *   `seedBundle` is a git bundle holding the existing backup, for repos too
+ *   large for the target to hold. It stands in for the target as the source
+ *   of existing history, so rewritten and deleted refs are still kept.
  */
-export async function syncRepo(job, { workdir, onPhase = () => {}, now = new Date() }) {
+export async function syncRepo(job, { workdir, onPhase = () => {}, now = new Date(), seedBundle }) {
 	const repoDir = join(workdir, "repo.git");
 	await rm(workdir, { recursive: true, force: true });
 	await mkdir(repoDir, { recursive: true });
@@ -104,7 +108,8 @@ export async function syncRepo(job, { workdir, onPhase = () => {}, now = new Dat
 	const ts = stamp(now);
 
 	onPhase("fetching existing backup");
-	await git(repoDir, ["fetch", "--quiet", "--no-tags", target.url, "+refs/*:refs/*"], { authHeader: target.authHeader });
+	if (seedBundle) await git(repoDir, ["fetch", "--quiet", "--no-tags", seedBundle, "+refs/*:refs/*"]);
+	else await git(repoDir, ["fetch", "--quiet", "--no-tags", target.url, "+refs/*:refs/*"], { authHeader: target.authHeader });
 	const before = await listRefs(repoDir);
 
 	onPhase("listing source refs");
@@ -112,14 +117,20 @@ export async function syncRepo(job, { workdir, onPhase = () => {}, now = new Dat
 	if (source.pulls) patterns.push("refs/pull/*/head");
 	const upstream = await lsRemote(repoDir, source.url, source.authHeader, patterns);
 
+	// A snapshot is identified by the ref it preserves and the commit it
+	// pointed at, so two refs at one commit each keep their own name.
 	const snapshotted = new Set();
-	for (const [ref, sha] of before) if (ref.startsWith(SNAPSHOT_PREFIX)) snapshotted.add(sha);
+	for (const [ref, sha] of before) {
+		const kept = /^refs\/backup\/[^/]+\/[^/]+\/(.+)$/.exec(ref);
+		if (kept) snapshotted.add(`${kept[1]} ${sha}`);
+	}
 	const snapshots = [];
 	const snapshot = async (kind, ref, sha) => {
-		if (snapshotted.has(sha)) return;
-		const name = `${SNAPSHOT_PREFIX}${kind}/${ts}/${ref.slice("refs/".length)}`;
+		const rest = ref.slice("refs/".length);
+		if (snapshotted.has(`${rest} ${sha}`)) return;
+		const name = `${SNAPSHOT_PREFIX}${kind}/${ts}/${rest}`;
 		await git(repoDir, ["update-ref", name, sha]);
-		snapshotted.add(sha);
+		snapshotted.add(`${rest} ${sha}`);
 		snapshots.push({ kind, ref, sha, name });
 	};
 

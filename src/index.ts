@@ -4,7 +4,7 @@ import { discover, queueDue, startBackup } from "./discovery.ts";
 import { type AppConfig, type Deployment, gh, GitHubError, loadDeployment } from "./github.ts";
 import { handleCode, serveAsset } from "./code.ts";
 import { handleMeta, metaCounts } from "./metaview.ts";
-import { clearFailures, clientAddress, pruneFailures, recordFailure, retryAfter } from "./ratelimit.ts";
+import { admit, clientAddress, pruneFailures, succeeded } from "./ratelimit.ts";
 import { lfsKey, lfsManifestKey, metaPrefix } from "./storage.ts";
 import { type CloneInfo, dashboardPage, lockedPage, loginPage, messagePage, repoPage, setupPage } from "./ui.ts";
 
@@ -80,8 +80,14 @@ async function isPassword(password: string, candidate: string | null | undefined
 }
 
 async function refresh(env: Env, dep: Deployment, trigger: string): Promise<{ accounts: number; repos: number; queued: number }> {
-	const found = await discover(env, dep);
-	return { ...found, queued: await queueDue(env, trigger) };
+	try {
+		const found = await discover(env, dep);
+		return { ...found, queued: await queueDue(env, trigger) };
+	} catch (err) {
+		// GitHub being unreachable must not stop known repos from syncing.
+		await queueDue(env, trigger).catch(() => {});
+		throw err;
+	}
 }
 
 const refreshLater = (env: Env, ctx: ExecutionContext, dep: Deployment, trigger: string) =>
@@ -112,22 +118,34 @@ async function adoptOrigin(env: Env, dep: Deployment, origin: string): Promise<v
 
 // --- Actions shared by the dashboard forms and the JSON API ---
 
-async function setAccount(env: Env, login: string, fields: { enabled?: unknown; include_forks?: unknown }): Promise<boolean> {
-	if (!(await getAccount(env.DB, login))) return false;
-	for (const field of ["enabled", "include_forks"] as const) {
-		const value = fields[field];
-		if (value === undefined || value === null) continue;
-		const on = value === true || value === 1 || value === "1";
-		await env.DB.prepare(`UPDATE accounts SET ${field} = ? WHERE login = ?`).bind(on ? 1 : 0, login).run();
+const isOn = (value: unknown) => value === true || value === 1 || value === "1";
+
+/**
+ * Account settings. `auto_public` and `auto_private` decide whether repos
+ * discovered from now on start out backed up; `auto_all` sets both.
+ * `select` switches every repo the account already has: "all" or "none".
+ */
+async function setAccount(env: Env, login: string, fields: Record<string, unknown>): Promise<boolean> {
+	const account = await getAccount(env.DB, login);
+	if (!account) return false;
+	const changes: Record<string, number> = {};
+	if (fields.auto_all !== undefined && fields.auto_all !== null) changes.auto_public = changes.auto_private = isOn(fields.auto_all) ? 1 : 0;
+	for (const field of ["auto_public", "auto_private", "include_forks"] as const) {
+		if (fields[field] !== undefined && fields[field] !== null) changes[field] = isOn(fields[field]) ? 1 : 0;
+	}
+	for (const [field, value] of Object.entries(changes)) {
+		await env.DB.prepare(`UPDATE accounts SET ${field} = ? WHERE login = ?`).bind(value, login).run();
+	}
+	if (fields.select === "all") {
+		const forks = (changes.include_forks ?? account.include_forks) === 1;
+		await env.DB.prepare(`UPDATE repos SET override = 1 WHERE account = ? AND gone_at IS NULL ${forks ? "" : "AND fork = 0"}`).bind(login).run();
+	} else if (fields.select === "none") {
+		await env.DB.prepare(`UPDATE repos SET override = 0 WHERE account = ?`).bind(login).run();
 	}
 	return true;
 }
 
-function parseOverride(value: unknown): 0 | 1 | null {
-	if (value === 1 || value === "1" || value === true) return 1;
-	if (value === 0 || value === "0" || value === false) return 0;
-	return null;
-}
+const parseOverride = (value: unknown): 0 | 1 => (isOn(value) ? 1 : 0);
 
 async function cloneCommands(env: Env, repo: Repo): Promise<CloneInfo[]> {
 	const out: CloneInfo[] = [];
@@ -190,7 +208,7 @@ async function handleSetup(request: Request, env: Env, url: URL, secret: string)
 			webhook_secret: string;
 			client_id: string;
 			client_secret: string;
-			owner: { login: string };
+			owner: { login: string; id: number };
 		}>(null, `/app-manifests/${encodeURIComponent(code)}/conversions`, { method: "POST" });
 		await setConfig(env.DB, {
 			app_id: String(created.id),
@@ -200,6 +218,10 @@ async function handleSetup(request: Request, env: Env, url: URL, secret: string)
 			client_id: created.client_id,
 			client_secret: created.client_secret,
 			owner: created.owner.login,
+			owner_id: String(created.owner.id),
+			// A token used before the app existed is no longer needed, and may
+			// carry far more access than the app does.
+			github_token: null,
 		});
 		// Whoever just created the app is the owner, so sign them in directly.
 		const session = await sign(secret, { login: created.owner.login }, SESSION_TTL);
@@ -220,6 +242,9 @@ async function handleWebhook(request: Request, env: Env, ctx: ExecutionContext, 
 		const repo = await getRepo(env.DB, payload.repository.id);
 		const account = repo && (await getAccount(env.DB, repo.account));
 		if (repo && isBackedUp(repo, account ?? undefined)) {
+			// Marks the push as not yet fetched. A sync clears this when it
+			// starts, and runs again at its end if it was set meanwhile.
+			await env.DB.prepare(`UPDATE repos SET dirty = 1 WHERE id = ?`).bind(repo.id).run();
 			// Bursts of pushes collapse into one sync per two-minute window.
 			await startBackup(env, repo.id, "push", { force: true, dedupe: `push-${Math.floor(Date.now() / 120_000)}` });
 		}
@@ -230,7 +255,7 @@ async function handleWebhook(request: Request, env: Env, ctx: ExecutionContext, 
 }
 
 /** Sign-in with GitHub, available once a GitHub App exists. */
-async function handleOAuth(request: Request, url: URL, dep: Deployment, app: AppConfig, secret: string): Promise<Response> {
+async function handleOAuth(request: Request, env: Env, url: URL, dep: Deployment, app: AppConfig, secret: string): Promise<Response> {
 	if (url.pathname === "/auth/login") {
 		const { state, cookie: stateCookie } = await newState(secret);
 		const target = new URL("https://github.com/login/oauth/authorize");
@@ -251,10 +276,14 @@ async function handleOAuth(request: Request, url: URL, dep: Deployment, app: App
 	});
 	const token = (await tokenRes.json<{ access_token?: string }>()).access_token;
 	if (!token) return messagePage("Sign-in failed", "GitHub did not accept the sign-in. Please try again.", 400, { href: "/", label: "Sign in" });
-	const user = await gh<{ login: string }>(token, "/user");
-	if (user.login.toLowerCase() !== dep.owner.toLowerCase()) {
+	const user = await gh<{ login: string; id: number }>(token, "/user");
+	// The numeric id is the identity. A login can be given up and registered
+	// by someone else; an id cannot.
+	const isOwner = dep.ownerId ? user.id === dep.ownerId : user.login.toLowerCase() === dep.owner.toLowerCase();
+	if (!isOwner) {
 		return messagePage("Not your backup", `This deployment belongs to ${dep.owner}. You are signed in to GitHub as ${user.login}.`, 403);
 	}
+	if (!dep.ownerId || user.login !== dep.owner) await setConfig(env.DB, { owner: user.login, owner_id: String(user.id) });
 	const session = await sign(secret, { login: user.login }, SESSION_TTL);
 	return redirect("/", [setCookie(SESSION_COOKIE, session, SESSION_TTL), setCookie(STATE_COOKIE, "", 0)]);
 }
@@ -264,31 +293,30 @@ async function handleOAuth(request: Request, url: URL, dep: Deployment, app: App
 async function handleApi(request: Request, env: Env, url: URL, dep: Deployment | null, password: string): Promise<Response> {
 	const path = url.pathname.slice("/api".length);
 	const post = request.method === "POST";
-	const body = post ? ((await request.json().catch(() => ({}))) as Record<string, unknown>) : {};
 
 	const bearer = /^Bearer (.+)$/.exec(request.headers.get("Authorization") ?? "")?.[1];
 	if (!bearer) return json({ error: "missing password" }, 401);
 	const address = clientAddress(request);
-	const wait = await retryAfter(env.DB, address);
+	const wait = await admit(env.DB, address);
 	if (wait > 0) return Response.json({ error: `too many wrong passwords; try again in ${Math.ceil(wait / 60)} minute(s)` }, { status: 429, headers: { "Retry-After": String(wait) } });
-	if (!(await isPassword(password, bearer))) {
-		await recordFailure(env.DB, address);
-		return json({ error: "wrong password" }, 401);
-	}
+	if (!(await isPassword(password, bearer))) return json({ error: "wrong password" }, 401);
+	await succeeded(env.DB, address);
+	// Nothing from the request is read until the caller has proved who they are.
+	const body = post ? ((await request.json().catch(() => ({}))) as Record<string, unknown>) : {};
 
 	if (path === "/github-token" && post) {
 		const token = body.token;
 		if (typeof token !== "string" || !token) return json({ error: "token is required" }, 400);
-		let user: { login: string };
+		let user: { login: string; id: number };
 		try {
-			user = await gh<{ login: string }>(token, "/user");
+			user = await gh<{ login: string; id: number }>(token, "/user");
 		} catch (err) {
 			return json({ error: `GitHub rejected the token: ${errorText(err)}` }, 400);
 		}
-		if (dep && dep.owner.toLowerCase() !== user.login.toLowerCase()) {
+		if (dep && (dep.ownerId ? dep.ownerId !== user.id : dep.owner.toLowerCase() !== user.login.toLowerCase())) {
 			return json({ error: `this deployment belongs to ${dep.owner}, but the token is for ${user.login}` }, 409);
 		}
-		await setConfig(env.DB, { github_token: token, owner: user.login });
+		await setConfig(env.DB, { github_token: token, owner: user.login, owner_id: String(user.id) });
 		const next = (await loadDeployment(env.DB))!;
 		return json({ owner: user.login, ...(await refresh(env, next, "setup")) });
 	}
@@ -324,7 +352,8 @@ async function handleApi(request: Request, env: Env, url: URL, dep: Deployment |
 	const accountMatch = /^\/accounts\/([^/]+)$/.exec(path);
 	if (accountMatch && post) {
 		if (!(await setAccount(env, decodeURIComponent(accountMatch[1]), body))) return json({ error: "no such account" }, 404);
-		return json(await refresh(env, dep, "settings"));
+		if (body.auto_public !== undefined || body.auto_all !== undefined) return json(await refresh(env, dep, "settings"));
+		return json({ queued: await queueDue(env, "settings") });
 	}
 
 	// Read access to everything a restore needs besides git itself.
@@ -337,7 +366,7 @@ async function handleApi(request: Request, env: Env, url: URL, dep: Deployment |
 	if (exportMatch && !post) {
 		const repo = await getRepo(env.DB, Number(exportMatch[1]));
 		if (!repo) return json({ error: "no such repository" }, 404);
-		const prefix = metaPrefix(repo.full_name);
+		const prefix = metaPrefix(repo);
 		if (exportMatch[2] === "lfs") {
 			const manifest = await env.BUCKET.get(lfsManifestKey(repo.id));
 			return json(manifest ? await manifest.json() : []);
@@ -386,6 +415,11 @@ async function handleApp(request: Request, env: Env, ctx: ExecutionContext, url:
 
 	if (path === "/" && !post) {
 		await adoptOrigin(env, dep, url.origin);
+		if (!dep.ownerId) {
+			// Deployments set up before ids were recorded: pin the owner's id now.
+			const found = await gh<{ id: number }>(null, `/users/${encodeURIComponent(dep.owner)}`).catch(() => null);
+			if (found) await setConfig(env.DB, { owner_id: String(found.id) });
+		}
 		const [accounts, repos, config] = await Promise.all([listAccounts(env.DB), listRepos(env.DB), getAllConfig(env.DB)]);
 		return dashboardPage({ origin: url.origin, owner: dep.owner, signedInAs: signedInAs === ADMIN ? "the password" : `GitHub (${signedInAs})`, slug: dep.app?.slug ?? null, accounts, repos, config, flash: message });
 	}
@@ -407,8 +441,10 @@ async function handleApp(request: Request, env: Env, ctx: ExecutionContext, url:
 	const accountMatch = /^\/accounts\/([^/]+)$/.exec(path);
 	if (accountMatch && post) {
 		const form = await request.formData();
-		await setAccount(env, decodeURIComponent(accountMatch[1]), { enabled: form.get("enabled"), include_forks: form.get("include_forks") });
-		refreshLater(env, ctx, dep, "settings");
+		await setAccount(env, decodeURIComponent(accountMatch[1]), Object.fromEntries(form));
+		// Switching on starred repos needs a listing; anything else just needs queueing.
+		if (form.has("auto_public") || form.has("auto_all")) refreshLater(env, ctx, dep, "settings");
+		else ctx.waitUntil(queueDue(env, "settings").catch((err) => console.error("queueing after settings change failed", err)));
 		return redirect("/");
 	}
 
@@ -481,25 +517,26 @@ export default {
 				return new Response("cross-origin request refused", { status: 403 });
 			}
 
-			const secret = await sessionSecret(env.DB);
+			// The password is part of the cookie key, so changing it signs
+			// everyone out, including any session an attacker may hold.
+			const secret = `${await sessionSecret(env.DB)}:${await sha256Hex(password)}`;
 			if (path === "/auth/logout" && request.method === "POST") return redirect("/", [setCookie(SESSION_COOKIE, "", 0)]);
 			if (path === "/auth/token" && request.method === "POST") {
 				const given = (await request.formData()).get("password");
 				const address = clientAddress(request);
-				const wait = await retryAfter(env.DB, address);
+				const wait = await admit(env.DB, address);
 				if (wait > 0) {
 					const res = messagePage("Too many attempts", `Password sign-in is paused for about ${Math.ceil(wait / 60)} minute(s) after repeated wrong passwords.`, 429, { href: "/", label: "Back" });
 					res.headers.set("Retry-After", String(wait));
 					return res;
 				}
 				if (!(await isPassword(password, typeof given === "string" ? given : null))) {
-					await recordFailure(env.DB, address);
 					return messagePage("Wrong password", "That is not this deployment's password.", 401, { href: "/", label: "Try again" });
 				}
-				await clearFailures(env.DB, address);
+				await succeeded(env.DB, address);
 				return redirect("/", [setCookie(SESSION_COOKIE, await sign(secret, { login: ADMIN }, SESSION_TTL), SESSION_TTL)]);
 			}
-			if ((path === "/auth/login" || path === "/auth/callback") && dep?.app) return await handleOAuth(request, url, dep, dep.app, secret);
+			if ((path === "/auth/login" || path === "/auth/callback") && dep?.app) return await handleOAuth(request, env, url, dep, dep.app, secret);
 
 			const session = await unsign<{ login: string }>(secret, cookie(request, SESSION_COOKIE));
 			const signedIn = !!session && (session.login === ADMIN || (!!dep && session.login.toLowerCase() === dep.owner.toLowerCase()));

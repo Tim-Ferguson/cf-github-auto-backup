@@ -2,7 +2,8 @@
 //   lfs/<aa>/<oid>                      LFS objects, content-addressed and shared across repos
 //   lfs-manifests/<repo id>.json        every LFS object a repo's history references
 //   bundles/<repo id>/<timestamp>.bundle  full git bundles for repos too large for Artifacts
-//   meta/<owner>/<repo>/...             issues, pull requests, releases and friends as JSON
+//   meta/<repo id>/...                  issues, pull requests, releases and friends as JSON
+//                                       (meta/<owner>/<repo>/ for backups that predate id-based keys)
 
 import { gitBasicAuth } from "./github.ts";
 
@@ -10,9 +11,19 @@ const SINGLE_PUT_MAX = 4 * 1024 ** 3;
 const PART_SIZE = 256 * 1024 ** 2;
 const BUNDLES_KEPT = 3;
 
+/** Newest stored bundle for a repo, if any. */
+export async function latestBundle(bucket: R2Bucket, repoId: number): Promise<string | null> {
+	const { objects } = await bucket.list({ prefix: `bundles/${repoId}/` });
+	return objects.map((o) => o.key).sort().pop() ?? null;
+}
+
 export const lfsKey = (oid: string) => `lfs/${oid.slice(0, 2)}/${oid}`;
 export const lfsManifestKey = (repoId: number) => `lfs-manifests/${repoId}.json`;
-export const metaPrefix = (fullName: string) => `meta/${fullName}/`;
+/**
+ * Keyed by GitHub's repo id, never its name: names get renamed and reused,
+ * and a new repo must not land on an old one's backup.
+ */
+export const metaPrefix = (repo: { id: number; meta_prefix: string | null }) => repo.meta_prefix ?? `meta/${repo.id}/`;
 
 /** R2 needs a known length up front, which a plain fetch body does not promise. */
 function fixedLength(body: ReadableStream, size: number): ReadableStream {

@@ -3,7 +3,7 @@
 // R2, exactly as the GitHub REST API returned it.
 
 import { ghFetch, ghPage, GitHubError } from "./github.ts";
-import { metaPrefix, putStream } from "./storage.ts";
+import { putStream } from "./storage.ts";
 
 /**
  * Layout version of the metadata in R2 and its index in D1. Repos synced
@@ -107,7 +107,7 @@ export const RESOURCES: Resource[] = [
 				const key = `${ctx.prefix}release-assets/${asset.id}/${asset.name}`;
 				if ((await ctx.bucket.head(key))?.size === asset.size) continue;
 				const res = await ghFetch(ctx.token, asset.url, { headers: { Accept: "application/octet-stream" } });
-				if (!res.ok || !res.body) throw new GitHubError(res.status, asset.url, await res.text());
+				if (!res.ok || !res.body) throw new GitHubError(res.status, asset.url, await res.text(), res.headers);
 				await putStream(ctx.bucket, key, res.body, asset.size);
 			}
 		},
@@ -123,28 +123,43 @@ async function pool<T>(items: T[], limit: number, fn: (item: T) => Promise<void>
 	);
 }
 
-/**
- * Stores one page of a resource and returns the URL of the next page, or
- * null when the resource is finished (or not available for this repo).
- */
+export interface PageResult {
+	/** URL of the next page, or null when the resource is finished or not available. */
+	next: string | null;
+	stored: number;
+	/** Set when GitHub rate-limited the request: try this same page again at this time. */
+	retryAt?: number;
+}
+
+/** Stores one page of a resource. `prefix` is the repo's metadata location in R2. */
 export async function syncMetadataPage(
 	bucket: R2Bucket,
 	token: string | null,
 	fullName: string,
+	prefix: string,
 	resource: Resource,
 	url: string | null,
 	since: string | null,
 	index?: { db: D1Database; repoId: number },
-): Promise<{ next: string | null; stored: number }> {
-	const ctx: PageContext = { bucket, token, fullName, prefix: metaPrefix(fullName) };
-	let page: { items: Item[]; next: string | null };
+): Promise<PageResult> {
+	const ctx: PageContext = { bucket, token, fullName, prefix };
+	const current = url ?? resource.path(fullName, since);
 	try {
-		page = await ghPage<Item>(token, url ?? resource.path(fullName, since));
+		return await syncPage(ctx, resource, current, since, index);
 	} catch (err) {
+		if (!(err instanceof GitHubError)) throw err;
+		// A rate limit is not an answer. Hand the same page back to be retried
+		// later, so nothing is recorded as "synced" that was never fetched.
+		if (err.retryAt) return { next: current, stored: 0, retryAt: err.retryAt };
 		// Issues disabled (410), feature off or not permitted (403/404): skip.
-		if (err instanceof GitHubError && [403, 404, 410, 451].includes(err.status)) return { next: null, stored: 0 };
+		if ([403, 404, 410, 451].includes(err.status)) return { next: null, stored: 0 };
 		throw err;
 	}
+}
+
+async function syncPage(ctx: PageContext, resource: Resource, url: string, since: string | null, index?: { db: D1Database; repoId: number }): Promise<PageResult> {
+	const { bucket } = ctx;
+	const page = await ghPage<Item>(ctx.token, url);
 
 	let items = page.items;
 	let done = false;
@@ -180,13 +195,13 @@ export async function syncMetadataPage(
  * their new place. Nothing is dropped: a comment since deleted on GitHub
  * exists only here, so each file is copied before its old key is removed.
  */
-export async function regroupFlatComments(bucket: R2Bucket, fullName: string): Promise<number> {
+export async function regroupFlatComments(bucket: R2Bucket, metaRoot: string): Promise<number> {
 	let moved = 0;
 	for (const [dir, parent] of [
 		["issue-comments/", "issue_url"],
 		["pull-comments/", "pull_request_url"],
 	] as const) {
-		const prefix = metaPrefix(fullName) + dir;
+		const prefix = metaRoot + dir;
 		let cursor: string | undefined;
 		do {
 			// The delimiter limits the listing to files directly in the folder.

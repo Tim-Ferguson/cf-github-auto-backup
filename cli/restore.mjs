@@ -12,7 +12,10 @@ import { dirname, join } from "node:path";
 import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 
-const WRITE_PAUSE_MS = 1200;
+// GitHub allows about 80 content-creating requests a minute and 500 an hour.
+const WRITE_PAUSE_MS = 1000;
+const WRITES_PER_HOUR = 450;
+const HOUR_MS = 60 * 60 * 1000;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 function exec(cmd, args, { cwd, env, input } = {}) {
@@ -72,6 +75,7 @@ export async function restore(ctx, args) {
 	const isPublic = flags.has("--public") || (!flags.has("--private") && !repo.private && !flags.has("--yes") && !flags.has("--dry-run") && (await confirm("The original was public. Make the restored copy public too?", false)));
 	const withIssues = !flags.has("--skip-issues");
 	const withReleases = !flags.has("--skip-releases");
+	const resume = flags.has("--resume");
 	const dryRun = flags.has("--dry-run");
 
 	if (dryRun) say(`\nDry run: nothing will be created on GitHub. The destination would be ${bold(target)}, as ${bold(login)}.`);
@@ -80,7 +84,23 @@ export async function restore(ctx, args) {
 		if (!flags.has("--yes") && !(await confirm("Go ahead?"))) return;
 	}
 
+	// Paces writes so a long restore stays under GitHub's hourly limit instead
+	// of running into it and stalling.
+	const writes = [];
+	const pace = async (say) => {
+		const cutoff = Date.now() - HOUR_MS;
+		while (writes.length && writes[0] < cutoff) writes.shift();
+		if (writes.length >= WRITES_PER_HOUR) {
+			const wait = writes[0] + HOUR_MS - Date.now() + 1000;
+			say(`\n  Pausing ${Math.ceil(wait / 60000)} minute(s) to stay within GitHub's hourly limit…`);
+			await sleep(wait);
+		}
+		writes.push(Date.now());
+		await sleep(WRITE_PAUSE_MS);
+	};
+
 	const gh = async (method, path, body) => {
+		if (method !== "GET") await pace(say);
 		for (let attempt = 0; ; attempt++) {
 			const res = await exec("gh", ["api", "-X", method, path, ...(body === undefined ? [] : ["--input", "-"])], { input: body === undefined ? undefined : JSON.stringify(body) });
 			if (res.code === 0) return res.out ? JSON.parse(res.out) : null;
@@ -99,9 +119,16 @@ export async function restore(ctx, args) {
 		mkdirSync(dirname(file), { recursive: true });
 		await pipeline(Readable.fromWeb(res.body), createWriteStream(file));
 	};
+	// Null means "not in the backup". Any other failure stops the restore:
+	// treating a hiccup as a missing item would silently drop real content.
 	const fetchJson = async (key) => {
-		const res = await fetch(`${state.url}/api/repos/${repo.id}/file?key=${encodeURIComponent(key)}`, { headers: { Authorization: `Bearer ${state.password}` } });
-		return res.ok ? res.json() : null;
+		for (let attempt = 0; ; attempt++) {
+			const res = await fetch(`${state.url}/api/repos/${repo.id}/file?key=${encodeURIComponent(key)}`, { headers: { Authorization: `Bearer ${state.password}` } }).catch(() => null);
+			if (res?.ok) return res.json();
+			if (res?.status === 404) return null;
+			if (attempt >= 4) throw new Abort(`Reading ${key} from the backup failed (${res ? res.status : "no response"}). Nothing was skipped; run again with --resume.`);
+			await sleep(2000 * (attempt + 1));
+		}
 	};
 	const listFiles = async (prefix) => {
 		const files = [];
@@ -138,32 +165,51 @@ export async function restore(ctx, args) {
 			say(`  push ${count("refs/heads/")} branches, ${count("refs/tags/")} tags and ${count("refs/backup/")} kept snapshots`);
 			if (lfs.length) say(`  upload ${lfs.length} LFS objects`);
 			if (clones.some((c) => c.label === "Wiki")) say("  push the wiki");
-			if (withIssues && issues.length) say(`  recreate ${issues.length} issues and pull request discussions, about ${Math.ceil((issues.length * 3 * WRITE_PAUSE_MS) / 60000)} minute(s) or more`);
+			if (withIssues && issues.length) say(`  recreate ${issues.length} issues and pull request discussions, at up to ${WRITES_PER_HOUR} writes an hour`);
 			if (withReleases && releases.length) say(`  recreate ${releases.length} releases`);
 			if (count("refs/pull/")) say(dim(`  leave ${count("refs/pull/")} pull request heads in the backup only`));
+			if (count("refs/backup/") && isPublic && !flags.has("--include-snapshots")) say(dim(`  leave ${count("refs/backup/")} kept snapshots out, because the destination is public`));
 			return;
 		}
 
 		step("2. Creating the repository on GitHub");
 		const [owner, name] = target.split("/");
-		try {
-			await gh("POST", owner === login ? "user/repos" : `orgs/${owner}/repos`, { name, private: !isPublic, has_issues: true, has_wiki: true, description: `Restored from a backup of ${repo.full_name}` });
-		} catch (err) {
-			throw new Abort(/already exists/i.test(err.output ?? "") ? `${target} already exists. Pick another name with --to owner/name, or delete it first.` : `Could not create ${target}: ${err.message}`);
+		const exists = (await exec("gh", ["api", `repos/${target}`])).code === 0;
+		if (exists && !resume) throw new Abort(`${target} already exists. To continue an interrupted restore into it, add --resume. Otherwise pick another name with --to owner/name.`);
+		if (!exists) {
+			try {
+				await gh("POST", owner === login ? "user/repos" : `orgs/${owner}/repos`, { name, private: !isPublic, has_issues: true, has_wiki: true, description: `Restored from a backup of ${repo.full_name}` });
+			} catch (err) {
+				throw new Abort(`Could not create ${target}: ${err.message}`);
+			}
 		}
-		ok(`https://github.com/${target}`);
+		ok(`https://github.com/${target}${exists ? "  (continuing)" : ""}`);
 
 		step("3. Pushing history");
 		const dest = `https://github.com/${target}.git`;
 		const destEnv = gitAuth("x-access-token", ghToken);
-		// GitHub refuses refs/pull/*, and only shows branches and tags, so the
-		// kept snapshots go up as branches named backup/….
-		res = await exec("git", ["push", "--quiet", dest, "+refs/heads/*:refs/heads/*", "+refs/tags/*:refs/tags/*", "+refs/backup/*:refs/heads/backup/*"], { cwd: mirror, env: destEnv });
-		if (res.code !== 0) throw new Abort(`Pushing to ${target} failed: ${res.err.trim()}`);
+		// GitHub refuses refs/pull/* and only shows branches and tags, so kept
+		// snapshots go up as branches named backup/…, or as tags when they
+		// preserve an annotated tag (a branch cannot point at a tag object).
+		const specs = ["+refs/heads/*:refs/heads/*", "+refs/tags/*:refs/tags/*"];
+		// Snapshots hold history that was deliberately rewritten or deleted,
+		// which is often how a leaked secret was removed. They never go to a
+		// public repository unless asked for.
+		const withSnapshots = count("refs/backup/") > 0 && (!isPublic || flags.has("--include-snapshots"));
+		if (withSnapshots) {
+			const kept = (await exec("git", ["for-each-ref", "--format=%(objecttype) %(refname)", "refs/backup/"], { cwd: mirror })).out.split("\n").filter(Boolean);
+			for (const line of kept) {
+				const [type, ref] = line.split(" ");
+				specs.push(`+${ref}:${type === "tag" ? "refs/tags/backup/" : "refs/heads/backup/"}${ref.slice("refs/backup/".length)}`);
+			}
+		}
+		res = await exec("git", ["push", "--quiet", dest, ...specs], { cwd: mirror, env: destEnv });
+		if (res.code !== 0) throw new Abort(`Pushing to ${target} failed: ${res.err.trim()}\nThe repository was created; fix the cause and run again with --resume.`);
 		if (repo.default_branch && refs.includes(`refs/heads/${repo.default_branch}`)) await gh("PATCH", `repos/${target}`, { default_branch: repo.default_branch }).catch(() => {});
 		ok("Branches and tags pushed");
 		done.push(`${count("refs/heads/")} branches and ${count("refs/tags/")} tags`);
-		if (count("refs/backup/")) done.push(`${count("refs/backup/")} kept snapshots, as branches named backup/…`);
+		if (withSnapshots) done.push(`${count("refs/backup/")} kept snapshots, under backup/…`);
+		else if (count("refs/backup/")) notes.push(`${count("refs/backup/")} kept snapshots of rewritten or deleted history were left out because the destination is public. Add --include-snapshots to publish them.`);
 		if (count("refs/pull/")) notes.push(`${count("refs/pull/")} pull request heads stay in the backup only: GitHub does not accept refs/pull/* from outside.`);
 
 		const manifest = await api(state, `/repos/${repo.id}/lfs`);
@@ -207,13 +253,17 @@ export async function restore(ctx, args) {
 				}
 				let restored = 0;
 				const wanted = new Set(issueFiles);
-				for (let n = 1; n <= issueFiles[issueFiles.length - 1]; n++) {
+				// On --resume, carry on after the last issue already there. The
+				// one being written when the run stopped may be missing comments.
+				const newest = await gh("GET", `repos/${target}/issues?state=all&per_page=1&sort=created&direction=desc`);
+				const from = (newest?.[0]?.number ?? 0) + 1;
+				if (from > 1) notes.push(`Issues up to #${from - 1} were already there and were left as they are; check #${from - 1} for missing comments.`);
+				for (let n = from; n <= issueFiles[issueFiles.length - 1]; n++) {
 					const issue = wanted.has(n) ? await fetchJson(`issues/${n}.json`) : null;
 					if (!issue) {
 						// A deleted issue left a gap; fill it so later numbers line up.
 						const filler = await gh("POST", `repos/${target}/issues`, { title: `(number ${n} was not in the backup)`, body: "Placeholder that keeps issue numbers aligned with the original repository." });
 						await gh("PATCH", `repos/${target}/issues/${filler.number}`, { state: "closed" });
-						await sleep(WRITE_PAUSE_MS);
 						continue;
 					}
 					const pull = issue.pull_request ? await fetchJson(`pulls/${n}.json`) : null;
@@ -226,7 +276,6 @@ export async function restore(ctx, args) {
 						labels: (issue.labels ?? []).map((l) => (typeof l === "string" ? l : l.name)),
 					});
 					if (created.number !== n) notes.push(`Issue #${n} was restored as #${created.number}; numbering drifted from there on.`);
-					await sleep(WRITE_PAUSE_MS);
 
 					const comments = [];
 					for (const f of await listFiles(`issue-comments/${n}/`)) {
@@ -244,7 +293,6 @@ export async function restore(ctx, args) {
 					}
 					for (const comment of comments.sort((a, b) => a.at.localeCompare(b.at))) {
 						await gh("POST", `repos/${target}/issues/${created.number}/comments`, { body: comment.body });
-						await sleep(WRITE_PAUSE_MS);
 					}
 					if (issue.state !== "open") await gh("PATCH", `repos/${target}/issues/${created.number}`, { state: "closed" });
 					restored++;
@@ -274,7 +322,6 @@ export async function restore(ctx, args) {
 						if (up.code === 0) assets++;
 						else notes.push(`Asset ${asset.name} of release ${r.tag_name} was not uploaded.`);
 					}
-					await sleep(WRITE_PAUSE_MS);
 				}
 				done.push(`${releases.length} releases with ${assets} assets`);
 			}

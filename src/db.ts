@@ -69,7 +69,35 @@ const SCHEMA = [
 
 // Columns added after the first release. SQLite has no ADD COLUMN IF NOT
 // EXISTS, so each runs on its own and "duplicate column" is the normal case.
-const MIGRATIONS = [`ALTER TABLE repos ADD COLUMN meta_version INTEGER NOT NULL DEFAULT 0`];
+const MIGRATIONS = [
+	`ALTER TABLE repos ADD COLUMN meta_version INTEGER NOT NULL DEFAULT 0`,
+	`ALTER TABLE repos ADD COLUMN meta_prefix TEXT`,
+	`ALTER TABLE repos ADD COLUMN dirty INTEGER NOT NULL DEFAULT 0`,
+	`ALTER TABLE repos ADD COLUMN run_instance TEXT`,
+	`ALTER TABLE accounts ADD COLUMN account_id INTEGER`,
+	`ALTER TABLE accounts ADD COLUMN auto_public INTEGER NOT NULL DEFAULT 0`,
+	`ALTER TABLE accounts ADD COLUMN auto_private INTEGER NOT NULL DEFAULT 0`,
+	// Backups made before storage was keyed by repo id keep the name-based
+	// location they already use, so nothing has to move.
+	`UPDATE repos SET meta_prefix = 'meta/' || full_name || '/' WHERE meta_prefix IS NULL AND (meta_cursor IS NOT NULL OR last_success_at IS NOT NULL)`,
+];
+
+/**
+ * One-time data changes, applied in order and recorded in config.schema_version.
+ *   1: every repo gets its own explicit on/off (repos.override), taken from
+ *      what the account-wide rule gave it, and that rule becomes the
+ *      account's auto-import setting for new repos.
+ */
+const DATA_MIGRATIONS: string[][] = [
+	[
+		`UPDATE accounts SET auto_public = enabled, auto_private = enabled`,
+		`UPDATE repos SET override = CASE
+			WHEN (SELECT a.enabled FROM accounts a WHERE a.login = repos.account) = 1
+			 AND (repos.fork = 0 OR (SELECT a.include_forks FROM accounts a WHERE a.login = repos.account) = 1)
+			THEN 1 ELSE 0 END
+		 WHERE override IS NULL`,
+	],
+];
 
 let ready: Promise<unknown> | undefined;
 
@@ -81,6 +109,13 @@ export function ensureSchema(db: D1Database): Promise<unknown> {
 				if (!/duplicate column/i.test(String(err))) throw err;
 			});
 		}
+		const done = Number((await db.prepare(`SELECT value FROM config WHERE key = 'schema_version'`).first<{ value: string }>())?.value ?? 0);
+		for (let version = done; version < DATA_MIGRATIONS.length; version++) {
+			await db.batch([
+				...DATA_MIGRATIONS[version].map((sql) => db.prepare(sql)),
+				db.prepare(`INSERT INTO config (key, value) VALUES ('schema_version', ?) ON CONFLICT (key) DO UPDATE SET value = excluded.value`).bind(String(version + 1)),
+			]);
+		}
 	})().catch((err) => {
 		ready = undefined;
 		throw err;
@@ -91,8 +126,16 @@ export function ensureSchema(db: D1Database): Promise<unknown> {
 export interface Account {
 	login: string;
 	kind: "User" | "Organization" | "starred";
+	/** GitHub's numeric id. Logins can be renamed and re-registered; ids cannot. */
+	account_id: number | null;
 	installation_id: number | null;
+	/** Superseded by auto_public and auto_private; kept for old rows. */
 	enabled: number;
+	/** New public repos in this account are backed up automatically. */
+	auto_public: number;
+	/** New private repos in this account are backed up automatically. */
+	auto_private: number;
+	/** Whether auto-import also takes forks. */
 	include_forks: number;
 	suspended: number;
 	uninstalled_at: string | null;
@@ -119,6 +162,12 @@ export interface Repo {
 	meta_cursor: string | null;
 	/** Layout version of this repo's metadata in R2; see META_VERSION. */
 	meta_version: number;
+	/** Where this repo's metadata lives in R2, fixed at its first sync. */
+	meta_prefix: string | null;
+	/** Set when a push arrives, cleared when a sync starts fetching. */
+	dirty: number;
+	/** Workflow instance that currently owns this repo's sync. */
+	run_instance: string | null;
 	last_run_at: string | null;
 	last_success_at: string | null;
 	last_status: "ok" | "error" | "running" | "queued" | null;
@@ -137,12 +186,19 @@ export interface Run {
 	detail: string | null;
 }
 
-/** A per-repo override wins; otherwise the owning account's toggles decide. */
-export function isBackedUp(repo: Repo, account: Account | undefined): boolean {
-	if (repo.gone_at) return false;
-	if (repo.override !== null) return repo.override === 1;
-	if (!account?.enabled) return false;
-	return !repo.fork || account.include_forks === 1;
+/**
+ * Each repo carries its own choice in `override` (1 on, 0 off). It is set
+ * when the repo is first seen, from its account's auto-import settings, and
+ * only changes when the owner changes it.
+ */
+export function isBackedUp(repo: Repo, _account?: Account | null): boolean {
+	return !repo.gone_at && repo.override === 1;
+}
+
+/** Whether a newly discovered repo should start out backed up. */
+export function autoImports(account: Pick<Account, "auto_public" | "auto_private" | "include_forks">, repo: { private: boolean; fork: boolean }): boolean {
+	if (repo.fork && !account.include_forks) return false;
+	return (repo.private ? account.auto_private : account.auto_public) === 1;
 }
 
 export async function getConfig(db: D1Database, key: string): Promise<string | null> {

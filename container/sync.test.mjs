@@ -120,8 +120,9 @@ test("deleted branches and tags are retained, and the name can be reused", async
 		assert.equal(refs["refs/backup/deleted/20261013T120000Z/heads/feature"], featureTip);
 		assert.equal(refs["refs/heads/feature"], undefined);
 		assert.ok(refs["refs/heads/feature/nested"]);
-		// The tag pointed at the same commit, so one snapshot already covers it.
-		assert.equal(result.refs.snapshots, 1);
+		// The tag pointed at the same commit and still keeps its own name.
+		assert.equal(refs["refs/backup/deleted/20261013T120000Z/tags/old-tag"], featureTip);
+		assert.equal(result.refs.snapshots, 2);
 	} finally {
 		t.cleanup();
 	}
@@ -172,6 +173,46 @@ test("finds LFS pointers and falls back to a bundle for oversized blobs", async 
 		assert.deepEqual(t.refs(), {}, "oversized repos are not pushed");
 		assert.deepEqual(JSON.parse(readFileSync(result.lfs.path, "utf8")), [{ oid, size: 12345 }]);
 		assert.match(git(t.root, "bundle", "list-heads", result.bundle.path), /refs\/heads\/main/);
+	} finally {
+		t.cleanup();
+	}
+});
+
+test("bundle-stored repos keep force-pushed history by seeding from the last bundle", async () => {
+	const t = setup();
+	try {
+		t.commit("a.txt", "one");
+		const lost = t.commit("big.bin", "x".repeat(5000));
+		git(t.work, "push", "-q", "origin", "main");
+		const limits = { maxBlobBytes: 1000 };
+
+		const first = await t.run({ limits });
+		assert.ok(first.bundle, "too large for the target, so it is bundled");
+		const seed = join(t.root, "seed.bundle");
+		writeFileSync(seed, readFileSync(first.bundle.path));
+
+		git(t.work, "reset", "-q", "--hard", "HEAD~1");
+		t.commit("c.txt", "rewrite");
+		git(t.work, "push", "-q", "--force", "origin", "main");
+
+		const second = await syncRepo({ source: { url: t.source }, target: { url: t.target }, limits }, { workdir: join(t.root, "sync"), now: new Date("2026-10-13T12:00:00Z"), seedBundle: seed });
+		assert.deepEqual(second.newSnapshots, ["refs/backup/rewritten/20261013T120000Z/heads/main"]);
+		const heads = git(t.root, "bundle", "list-heads", second.bundle.path);
+		assert.match(heads, new RegExp(`${lost} refs/backup/rewritten/20261013T120000Z/heads/main`), "the new bundle carries the overwritten commit");
+	} finally {
+		t.cleanup();
+	}
+});
+
+test("LFS pointers with CRLF line endings are found", async () => {
+	const t = setup();
+	try {
+		const oid = "4d7a214614ab2935c943f9e0ff69d22eadbb8f32b1258daaa5e2ca24d17e2393";
+		git(t.work, "config", "core.autocrlf", "false");
+		t.commit("win.bin", `version https://git-lfs.github.com/spec/v1\r\noid sha256:${oid}\r\nsize 4321\r\n${" ".repeat(40)}`);
+		git(t.work, "push", "-q", "origin", "main");
+		const result = await t.run();
+		assert.deepEqual(JSON.parse(readFileSync(result.lfs.path, "utf8")), [{ oid, size: 4321 }]);
 	} finally {
 		t.cleanup();
 	}

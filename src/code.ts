@@ -163,8 +163,30 @@ const DASHBOARD_JS = `
 })();
 `;
 
+// Runs in <head>, before first paint, so a chosen theme never flashes.
+const THEME_JS = `
+(function () {
+	var KEY = "ghb-theme", ORDER = ["system", "light", "dark"];
+	function read() { try { return localStorage.getItem(KEY) || "system"; } catch (e) { return "system"; } }
+	function apply(mode) {
+		if (mode === "system") document.documentElement.removeAttribute("data-theme");
+		else document.documentElement.setAttribute("data-theme", mode);
+		document.querySelectorAll("[data-theme-toggle]").forEach(function (b) { b.textContent = "Theme: " + mode; });
+	}
+	apply(read());
+	document.addEventListener("DOMContentLoaded", function () { apply(read()); });
+	document.addEventListener("click", function (e) {
+		var button = e.target.closest && e.target.closest("[data-theme-toggle]");
+		if (!button) return;
+		var next = ORDER[(ORDER.indexOf(read()) + 1) % ORDER.length];
+		try { localStorage.setItem(KEY, next); } catch (err) {}
+		apply(next);
+	});
+})();
+`;
+
 const CODE_CSS = `
-.crumbs { font-size:15px; word-break:break-all; } .crumbs a { color:var(--accent); text-decoration:none; }
+.crumbs { font-size:15px; word-break:break-all; } .crumbs a { color:var(--link); text-decoration:none; }
 .bar { display:flex; flex-wrap:wrap; gap:10px; align-items:center; justify-content:space-between; margin-bottom:12px; }
 .files td { white-space:normal; } .files td.size, .files td.kind { white-space:nowrap; width:1%; color:var(--muted); }
 .files a { text-decoration:none; } .files a:hover { text-decoration:underline; }
@@ -175,12 +197,12 @@ const CODE_CSS = `
 .preview { text-align:center; padding:16px; } .preview img { max-width:100%; }
 .md { line-height:1.6; overflow-wrap:anywhere; } .md img { max-width:100%; }
 .md h1, .md h2 { border-bottom:1px solid var(--line); padding-bottom:6px; margin:24px 0 12px; font-size:22px; } .md h2 { font-size:18px; } .md h3 { font-size:15px; }
-.md a { color:var(--accent); } .md pre { padding:12px; } .md code { background:var(--chip); padding:1px 5px; border-radius:4px; } .md pre code { background:transparent; padding:0; }
+.md a { color:var(--link); } .md pre { padding:12px; } .md code { background:var(--chip); padding:1px 5px; border-radius:4px; } .md pre code { background:transparent; padding:0; }
 .md blockquote { margin:0; padding-left:14px; border-left:3px solid var(--line); color:var(--muted); }
 .md table { width:auto; } .md th, .md td { border:1px solid var(--line); white-space:normal; }
 .commit-msg { white-space:normal; }
 .state { display:inline-block; font-size:12px; font-weight:600; padding:1px 9px; border-radius:99px; border:1px solid currentColor; white-space:nowrap; }
-.state.merged { color:#8250df; } @media (prefers-color-scheme: dark) { .state.merged { color:#b392f0; } }
+.state.merged { color:var(--merged); }
 .bar input[type=search] { font:inherit; padding:6px 10px; border-radius:7px; border:1px solid var(--line); background:var(--card); color:var(--text); width:240px; max-width:100%; }
 main:has(.browser) { max-width:1560px; }
 .browser { display:grid; grid-template-columns:290px minmax(0,1fr); gap:16px; align-items:start; }
@@ -204,7 +226,8 @@ main:has(.browser) { max-width:1560px; }
 	.side:not([open]) > :not(summary) { display:none; }
 }
 ${lightTheme}
-@media (prefers-color-scheme: dark) { ${darkTheme} }
+@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) { ${darkTheme} } }
+:root[data-theme="dark"] { ${darkTheme} }
 .hljs { background:transparent; }
 pre code.hljs { padding:0; overflow-x:visible; }
 `;
@@ -216,6 +239,7 @@ export function serveAsset(path: string): Response | null {
 		"/assets/highlight.js": [highlightJs, "text/javascript; charset=utf-8"],
 		"/assets/code.js": [CLIENT_JS, "text/javascript; charset=utf-8"],
 		"/assets/dash.js": [DASHBOARD_JS, "text/javascript; charset=utf-8"],
+		"/assets/theme.js": [THEME_JS, "text/javascript; charset=utf-8"],
 		"/assets/code.css": [CODE_CSS, "text/css; charset=utf-8"],
 	};
 	const asset = assets[path];
@@ -232,6 +256,12 @@ const LANGUAGES: Record<string, string> = {
 	makefile: "makefile", mk: "makefile", txt: "plaintext",
 };
 const IMAGE_TYPES: Record<string, string> = { png: "image/png", jpg: "image/jpeg", jpeg: "image/jpeg", gif: "image/gif", webp: "image/webp", svg: "image/svg+xml", ico: "image/x-icon", avif: "image/avif" };
+
+/** Commit times as an ISO string; a nonsense timestamp must not break the page. */
+function commitDate(seconds: number): string {
+	const date = new Date(seconds * (seconds < 1e11 ? 1000 : 1));
+	return Number.isNaN(date.getTime()) ? "" : date.toISOString();
+}
 
 const extension = (name: string) => (name.includes(".") ? name.slice(name.lastIndexOf(".") + 1) : name).toLowerCase();
 const isMarkdown = (name: string) => /\.(md|markdown)$/i.test(name);
@@ -430,7 +460,7 @@ async function render(handle: ArtifactsRepo, url: URL, repo: Repo, view: CodeVie
 			html`${header(`History of ${refLabel(current.name)}`)}
 <div class="card scroll"><table><thead><tr><th>Commit</th><th>Message</th><th>Author</th><th>When</th></tr></thead><tbody>
 ${commits.slice(0, COMMITS_PER_PAGE).map(
-	(c) => html`<tr><td><a class="link" href="${link("code", "", c.hash)}"><code>${c.hash.slice(0, 10)}</code></a></td><td class="commit-msg">${c.message.split("\n")[0].slice(0, 200)}</td><td>${c.author.name}</td><td class="muted">${new Date(c.committedAt * (c.committedAt < 1e11 ? 1000 : 1)).toISOString().slice(0, 10)}</td></tr>`,
+	(c) => html`<tr><td><a class="link" href="${link("code", "", c.hash)}"><code>${c.hash.slice(0, 10)}</code></a></td><td class="commit-msg">${c.message.split("\n")[0].slice(0, 200)}</td><td>${c.author.name}</td><td class="muted">${commitDate(c.committedAt).slice(0, 10)}</td></tr>`,
 )}
 </tbody></table></div>
 <div class="row">${pageNo > 0 ? html`<a class="btn" href="${link("commits")}&page=${pageNo - 1}">Newer</a>` : ""}${more ? html`<a class="btn" href="${link("commits")}&page=${pageNo + 1}">Older</a>` : ""}</div>`,
@@ -455,7 +485,7 @@ ${commits.slice(0, COMMITS_PER_PAGE).map(
 				readme = html`<div class="card"><h3>${readmeEntry.name}</h3>${isMarkdown(readmeEntry.name) ? html`<article class="md">${raw(renderMarkdown(text, markdownContext(path)))}</article>` : html`<pre>${text}</pre>`}</div>`;
 			}
 		}
-		const when = new Date(commit.committedAt * (commit.committedAt < 1e11 ? 1000 : 1)).toISOString();
+		const when = commitDate(commit.committedAt) || null;
 		return show(
 			path || "Files",
 			html`${header(repo.full_name)}
