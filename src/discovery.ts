@@ -3,8 +3,8 @@
 // disappear are only marked gone, which freezes their backup.
 
 import { appJwt } from "./crypto.ts";
-import { type Account, autoImports, batched, getAccount, isBackedUp, listAccounts, listRepos, type Repo, setConfig, STARRED } from "./db.ts";
-import { type AppConfig, type Deployment, ghAll, type GhInstallation, type GhRepo, GitHubError, installationToken } from "./github.ts";
+import { type Account, autoImports, batched, getAccount, isBackedUp, listAccounts, listRepos, type Repo, setConfig } from "./db.ts";
+import { type AppConfig, type Deployment, ghAll, type GhInstallation, type GhRepo, installationToken } from "./github.ts";
 import type { BackupParams } from "./workflow.ts";
 
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -21,7 +21,7 @@ function upsertRepo(db: D1Database, account: Account, r: GhRepo, now: string): D
 			`INSERT INTO repos (id, account, full_name, private, fork, archived, has_wiki, default_branch, pushed_at, override, seen_at, gone_at)
 			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
 			 ON CONFLICT (id) DO UPDATE SET
-				account = CASE WHEN excluded.account = '${STARRED}' AND repos.account != '${STARRED}' AND repos.gone_at IS NULL THEN repos.account ELSE excluded.account END,
+				account = excluded.account,
 				full_name = excluded.full_name, private = excluded.private, fork = excluded.fork, archived = excluded.archived,
 				has_wiki = excluded.has_wiki, default_branch = excluded.default_branch, pushed_at = excluded.pushed_at,
 				seen_at = MAX(COALESCE(repos.seen_at, ''), excluded.seen_at), gone_at = NULL`,
@@ -81,7 +81,7 @@ async function reconcileAccount(
 }
 
 /** GitHub App mode: one account per installation. */
-async function discoverInstallations(db: D1Database, dep: Deployment, app: AppConfig, now: string): Promise<{ accounts: number; repos: number; token: string | null }> {
+async function discoverInstallations(db: D1Database, dep: Deployment, app: AppConfig, now: string): Promise<{ accounts: number; repos: number }> {
 	let installations: GhInstallation[];
 	try {
 		installations = await ghAll<GhInstallation>(await appJwt(app.appId, app.privateKey), "/app/installations?per_page=100");
@@ -92,7 +92,6 @@ async function discoverInstallations(db: D1Database, dep: Deployment, app: AppCo
 
 	const known = new Map((await listAccounts(db)).map((a) => [a.login, a]));
 	let repoCount = 0;
-	let anyToken: string | null = null;
 
 	for (const inst of installations) {
 		const login = inst.account.login;
@@ -103,7 +102,6 @@ async function discoverInstallations(db: D1Database, dep: Deployment, app: AppCo
 			known.delete(login);
 			if (inst.suspended_at) continue;
 			const token = await installationToken(app, inst.id);
-			anyToken ??= token;
 			const repos = await ghAll<GhRepo>(token, "/installation/repositories?per_page=100");
 			await batched(db, repos.map((r) => upsertRepo(db, account, r, now)));
 			// Only after a complete listing: whatever was not seen is gone.
@@ -116,17 +114,18 @@ async function discoverInstallations(db: D1Database, dep: Deployment, app: AppCo
 	}
 
 	for (const account of known.values()) {
+		// Leftover starred-repo backups from older versions belong to no installation.
 		if (account.kind === "starred" || account.uninstalled_at) continue;
 		await db.batch([
 			db.prepare(`UPDATE accounts SET uninstalled_at = ?, installation_id = NULL WHERE login = ?`).bind(now, account.login),
 			db.prepare(`UPDATE repos SET gone_at = ? WHERE account = ? AND gone_at IS NULL`).bind(now, account.login),
 		]);
 	}
-	return { accounts: installations.length, repos: repoCount, token: anyToken };
+	return { accounts: installations.length, repos: repoCount };
 }
 
 /** Token mode: everything the token can see, grouped by owner. */
-async function discoverWithToken(db: D1Database, dep: Deployment, token: string, now: string): Promise<{ accounts: number; repos: number; token: string | null }> {
+async function discoverWithToken(db: D1Database, dep: Deployment, token: string, now: string): Promise<{ accounts: number; repos: number }> {
 	let repos: GhRepo[];
 	try {
 		repos = await ghAll<GhRepo>(token, "/user/repos?per_page=100&affiliation=owner,organization_member");
@@ -144,7 +143,7 @@ async function discoverWithToken(db: D1Database, dep: Deployment, token: string,
 	// The listing was complete, so anything unseen under a real account is gone.
 	const known = (await listAccounts(db)).filter((a) => a.kind !== "starred");
 	await batched(db, known.map((a) => markUnseen(db, a.login, now)));
-	return { accounts: owners.size, repos: repos.length, token };
+	return { accounts: owners.size, repos: repos.length };
 }
 
 /** Lets only one discovery run at a time; overlapping ones would mark each other's repos gone. */
@@ -168,24 +167,7 @@ export async function discover(env: Env, dep: Deployment): Promise<{ accounts: n
 		const now = new Date().toISOString();
 		const found = dep.app ? await discoverInstallations(db, dep, dep.app, now) : await discoverWithToken(db, dep, dep.token!, now);
 		await setConfig(db, { github_error: null, github_error_since: null, last_discovery_at: now });
-		let repoCount = found.repos;
-
-		await db.prepare(`INSERT INTO accounts (login, kind, enabled) VALUES (?, 'starred', 0) ON CONFLICT (login) DO NOTHING`).bind(STARRED).run();
-		const starred = (await getAccount(db, STARRED))!;
-		if (starred.auto_public) {
-			try {
-				const stars = await ghAll<GhRepo>(found.token, `/users/${dep.owner}/starred?per_page=100`);
-				// Private stars are not listed here, and public ones clone without a token.
-				const publicStars = stars.filter((r) => !r.private);
-				await batched(db, publicStars.map((r) => upsertRepo(db, { ...starred, include_forks: 1 }, r, now)));
-				await markUnseen(db, STARRED, now).run();
-				repoCount += publicStars.length;
-			} catch (err) {
-				if (!(err instanceof GitHubError)) throw err;
-				console.error("listing starred repos failed", err);
-			}
-		}
-		return { accounts: found.accounts, repos: repoCount };
+		return found;
 	} finally {
 		await db.prepare(`DELETE FROM config WHERE key = 'discovery_lock'`).run();
 	}

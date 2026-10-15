@@ -1,6 +1,6 @@
 import { WorkflowEntrypoint, type WorkflowEvent, type WorkflowStep } from "cloudflare:workers";
 import { NonRetryableError } from "cloudflare:workflows";
-import { ensureSchema, getAccount, getRepo, isBackedUp, type Repo, STARRED, updateRepo } from "./db.ts";
+import { ensureSchema, getAccount, getRepo, isBackedUp, type Repo, updateRepo } from "./db.ts";
 import { gitBasicAuth, loadDeployment, tokenFor } from "./github.ts";
 import { META_VERSION, type PageResult, regroupFlatComments, RESOURCES, syncMetadataPage } from "./metadata.ts";
 import { type GitRunner, runnerFor } from "./runner.ts";
@@ -121,7 +121,6 @@ export class BackupWorkflow extends WorkflowEntrypoint<Env, BackupParams> {
 				metaPrefix: prefix,
 				defaultBranch: repo.default_branch,
 				hasWiki: repo.has_wiki === 1,
-				starred: repo.account === STARRED,
 				pushedAt: repo.pushed_at,
 				bundled: repo.storage === "r2-bundle",
 				hasLfs: repo.lfs_count > 0,
@@ -137,7 +136,6 @@ export class BackupWorkflow extends WorkflowEntrypoint<Env, BackupParams> {
 
 		const runner = () => runnerFor(env, repoId);
 		const sourceToken = async (): Promise<string | null> => {
-			if (plan.starred) return null;
 			const repo = await getRepo(env.DB, repoId);
 			const account = repo && (await getAccount(env.DB, repo.account));
 			const dep = await loadDeployment(env.DB);
@@ -166,7 +164,7 @@ export class BackupWorkflow extends WorkflowEntrypoint<Env, BackupParams> {
 					pulls: true,
 					optional: false,
 					seedBundle,
-					api: plan.starred ? null : `https://api.github.com/repos/${plan.fullName}`,
+					api: `https://api.github.com/repos/${plan.fullName}`,
 					knownSizeBytes: plan.sizeBytes,
 				});
 				if (!git) throw new NonRetryableError("git sync returned no result");
@@ -267,41 +265,37 @@ export class BackupWorkflow extends WorkflowEntrypoint<Env, BackupParams> {
 				}
 			}
 
-			// Metadata of starred repos is skipped: popular projects have
-			// hundreds of thousands of issues that are not yours to lose.
 			let metaComplete = true;
-			if (!plan.starred) {
-				const stored: Record<string, number> = {};
-				if (plan.metaUpgrade) {
-					await step.do("meta: upgrade layout", async () => regroupFlatComments(env.BUCKET, plan.metaPrefix));
-				}
-				for (const resource of RESOURCES) {
-					let url: string | null = null;
-					let waits = 0;
-					for (let page = 0; ; ) {
-						const res: PageResult = await step.do(
-							`meta: ${resource.name} ${page}${waits ? ` (attempt ${waits + 1})` : ""}`,
-							{ timeout: "30 minutes", retries: { limit: 4, delay: "30 seconds", backoff: "exponential" } },
-							async () => syncMetadataPage(env.BUCKET, await sourceToken(), plan.fullName, plan.metaPrefix, resource, url, plan.metaCursor, { db: env.DB, repoId }),
-						);
-						if (res.retryAt) {
-							// Rate limited: wait for GitHub's reset and ask for the same page again.
-							if (++waits > MAX_RATE_LIMIT_WAITS) throw new Error(`GitHub kept rate-limiting ${resource.name}; the next run continues from the same point`);
-							await step.sleepUntil(`meta: ${resource.name} ${page} wait ${waits}`, new Date(res.retryAt));
-							continue;
-						}
-						stored[resource.name] = (stored[resource.name] ?? 0) + res.stored;
-						url = res.next;
-						if (!url) break;
-						if (++page >= MAX_META_PAGES) {
-							metaComplete = false;
-							break;
-						}
+			const stored: Record<string, number> = {};
+			if (plan.metaUpgrade) {
+				await step.do("meta: upgrade layout", async () => regroupFlatComments(env.BUCKET, plan.metaPrefix));
+			}
+			for (const resource of RESOURCES) {
+				let url: string | null = null;
+				let waits = 0;
+				for (let page = 0; ; ) {
+					const res: PageResult = await step.do(
+						`meta: ${resource.name} ${page}${waits ? ` (attempt ${waits + 1})` : ""}`,
+						{ timeout: "30 minutes", retries: { limit: 4, delay: "30 seconds", backoff: "exponential" } },
+						async () => syncMetadataPage(env.BUCKET, await sourceToken(), plan.fullName, plan.metaPrefix, resource, url, plan.metaCursor, { db: env.DB, repoId }),
+					);
+					if (res.retryAt) {
+						// Rate limited: wait for GitHub's reset and ask for the same page again.
+						if (++waits > MAX_RATE_LIMIT_WAITS) throw new Error(`GitHub kept rate-limiting ${resource.name}; the next run continues from the same point`);
+						await step.sleepUntil(`meta: ${resource.name} ${page} wait ${waits}`, new Date(res.retryAt));
+						continue;
+					}
+					stored[resource.name] = (stored[resource.name] ?? 0) + res.stored;
+					url = res.next;
+					if (!url) break;
+					if (++page >= MAX_META_PAGES) {
+						metaComplete = false;
+						break;
 					}
 				}
-				detail.metadata = stored;
-				if (!metaComplete) detail.metadataIncomplete = `more than ${MAX_META_PAGES} pages of one kind; the rest is fetched on later runs`;
 			}
+			detail.metadata = stored;
+			if (!metaComplete) detail.metadataIncomplete = `more than ${MAX_META_PAGES} pages of one kind; the rest is fetched on later runs`;
 
 			await step.do("finish", async () => {
 				const now = cursorNow();
@@ -311,7 +305,7 @@ export class BackupWorkflow extends WorkflowEntrypoint<Env, BackupParams> {
 					last_success_at: now,
 					synced_pushed_at: plan.pushedAt,
 					// The cursor only moves when everything up to it was really fetched.
-					meta_cursor: plan.starred ? null : metaComplete ? plan.startedAt : plan.previousCursor,
+					meta_cursor: metaComplete ? plan.startedAt : plan.previousCursor,
 					...(metaComplete ? { meta_version: META_VERSION } : {}),
 					run_instance: null,
 				});

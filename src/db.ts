@@ -1,8 +1,6 @@
 // D1 access. The schema is applied lazily so a fresh deploy needs no
 // migration step.
 
-export const STARRED = "*starred";
-
 const SCHEMA = [
 	`CREATE TABLE IF NOT EXISTS config (key TEXT PRIMARY KEY, value TEXT NOT NULL)`,
 	`CREATE TABLE IF NOT EXISTS accounts (
@@ -96,6 +94,12 @@ const DATA_MIGRATIONS: string[][] = [
 			 AND (repos.fork = 0 OR (SELECT a.include_forks FROM accounts a WHERE a.login = repos.account) = 1)
 			THEN 1 ELSE 0 END
 		 WHERE override IS NULL`,
+	],
+	// Starred repos are no longer backed up. Any already stored are kept,
+	// frozen like a deleted repo; an unused starred section is removed.
+	[
+		`UPDATE repos SET gone_at = COALESCE(gone_at, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')) WHERE account = '*starred'`,
+		`DELETE FROM accounts WHERE kind = 'starred' AND NOT EXISTS (SELECT 1 FROM repos WHERE account = accounts.login)`,
 	],
 ];
 

@@ -404,7 +404,7 @@ async function setup(state) {
 	await connectGitHub(state);
 
 	step("6. What to back up");
-	say("Your own non-fork repositories are on. Organizations, forks and starred repos are off until you switch them on.");
+	say("Your own non-fork repositories are on. Organizations and forks are off until you switch them on.");
 	if (await confirm("Review that now?")) await accounts(state);
 
 	step("Done");
@@ -452,7 +452,8 @@ async function status(state) {
 
 /** "public and private", "public only", "off"… for an account's auto-import setting. */
 function autoLabel(a) {
-	if (a.kind === "starred") return a.auto_public ? "new stars imported" : "off";
+	// Starred repos were backed up by older versions; what they stored is kept but no longer synced.
+	if (a.kind === "starred") return "no longer synced";
 	const which = a.auto_public && a.auto_private ? "all new repos" : a.auto_public ? "new public repos" : a.auto_private ? "new private repos" : null;
 	return which ? `auto-imports ${which}${a.include_forks ? ", forks too" : ""}` : "no auto-import";
 }
@@ -461,7 +462,7 @@ async function accounts(state) {
 	for (;;) {
 		const s = await api(state, "/status");
 		const picked = await choose("What should be backed up?", [
-			...s.accounts.map((a) => {
+			...s.accounts.filter((a) => a.kind !== "starred").map((a) => {
 				const repos = s.repos.filter((r) => r.account === a.login);
 				return { value: a, label: accountLabel(a), hint: `${repos.filter((r) => r.backed_up).length}/${repos.length} repos on · ${autoLabel(a)}` };
 			}),
@@ -488,20 +489,15 @@ async function accounts(state) {
 		}
 
 		const onOff = (flag) => (flag ? "now on" : "now off");
-		const options =
-			picked.kind === "starred"
-				? [{ value: { auto_public: !picked.auto_public }, label: "Back up repositories I star", hint: onOff(picked.auto_public) }]
-				: [
-						{ value: { auto_all: !(picked.auto_public && picked.auto_private) }, label: "Automatically import all new repos", hint: onOff(picked.auto_public && picked.auto_private) },
-						{ value: { auto_public: !picked.auto_public }, label: "Automatically import new public repos", hint: onOff(picked.auto_public) },
-						{ value: { auto_private: !picked.auto_private }, label: "Automatically import new private repos", hint: onOff(picked.auto_private) },
-						{ value: { include_forks: !picked.include_forks }, label: "Include forks when importing", hint: onOff(picked.include_forks) },
-					];
-		options.push(
+		const options = [
+			{ value: { auto_all: !(picked.auto_public && picked.auto_private) }, label: "Automatically import all new repos", hint: onOff(picked.auto_public && picked.auto_private) },
+			{ value: { auto_public: !picked.auto_public }, label: "Automatically import new public repos", hint: onOff(picked.auto_public) },
+			{ value: { auto_private: !picked.auto_private }, label: "Automatically import new private repos", hint: onOff(picked.auto_private) },
+			{ value: { include_forks: !picked.include_forks }, label: "Include forks when importing", hint: onOff(picked.include_forks) },
 			{ value: { select: "all" }, label: "Back up every repo it has now" },
 			{ value: { select: "none" }, label: "Stop backing up every repo it has now", hint: "existing backups are kept" },
 			{ value: null, label: "Back" },
-		);
+		];
 		const change = await choose(`${accountLabel(picked)}  ${dim("(choosing a setting flips it)")}`, options);
 		if (!change) continue;
 		const result = await api(state, `/accounts/${encodeURIComponent(picked.login)}`, change);

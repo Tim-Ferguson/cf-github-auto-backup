@@ -352,7 +352,6 @@ async function handleApi(request: Request, env: Env, url: URL, dep: Deployment |
 	const accountMatch = /^\/accounts\/([^/]+)$/.exec(path);
 	if (accountMatch && post) {
 		if (!(await setAccount(env, decodeURIComponent(accountMatch[1]), body))) return json({ error: "no such account" }, 404);
-		if (body.auto_public !== undefined || body.auto_all !== undefined) return json(await refresh(env, dep, "settings"));
 		return json({ queued: await queueDue(env, "settings") });
 	}
 
@@ -442,9 +441,7 @@ async function handleApp(request: Request, env: Env, ctx: ExecutionContext, url:
 	if (accountMatch && post) {
 		const form = await request.formData();
 		await setAccount(env, decodeURIComponent(accountMatch[1]), Object.fromEntries(form));
-		// Switching on starred repos needs a listing; anything else just needs queueing.
-		if (form.has("auto_public") || form.has("auto_all")) refreshLater(env, ctx, dep, "settings");
-		else ctx.waitUntil(queueDue(env, "settings").catch((err) => console.error("queueing after settings change failed", err)));
+		ctx.waitUntil(queueDue(env, "settings").catch((err) => console.error("queueing after settings change failed", err)));
 		return redirect("/");
 	}
 

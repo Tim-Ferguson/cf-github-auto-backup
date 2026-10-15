@@ -1,5 +1,5 @@
-// Renders README files. Repository content is untrusted (forks and starred
-// repos are other people's), so nothing from the source reaches the page
+// Renders README files. Repository content is untrusted (forks and org
+// repos hold other people's work), so nothing from the source reaches the page
 // verbatim: Markdown is rendered by marked, and any raw HTML in it is rebuilt
 // from an allowlist of tags and attributes. The pages that show the result
 // also run under a CSP with no inline script.

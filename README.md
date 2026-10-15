@@ -54,7 +54,7 @@ Every repository has its own on/off switch in the dashboard. What a repository s
 - **Include forks**: whether automatic import also takes forks.
 - **Back up all** / **Stop all**: switch every repository the account has right now. Stopping keeps the existing backups.
 
-These are set per account and per organization. Out of the box your own account imports everything except forks, and every other account or organization imports nothing until you say so. **Starred repositories** have one switch: public repos only, git history only.
+These are set per account and per organization. Out of the box your own account imports everything except forks, and every other account or organization imports nothing until you say so.
 
 The dashboard follows your system's light or dark setting; the **Theme** button in the top corner overrides it.
 
@@ -90,7 +90,7 @@ The CLI walks you through everything and then becomes your control panel:
 3. **Password**: generates one or takes yours, and saves it to a git-ignored `.gh-backup.json`.
 4. **Deploys** the Worker, D1 database, R2 bucket and container with `cf deploy`, uploading the password as a secret in the same step.
 5. **GitHub**: pick one of the three ways below.
-6. **What to back up**: switch organizations, forks and starred repos on or off.
+6. **What to back up**: switch organizations and forks on or off.
 
 ### Locked until you set a password
 
@@ -292,8 +292,7 @@ If you try any of these, please open an issue with what happened, good or bad.
 | **Tags and releases** | Back up a repo with tags, releases and release assets | Tags are in the clone; releases and assets are under `meta/<owner>/<repo>/` in R2. |
 | **Many issues** | Back up a repo with thousands of issues or pull requests | All are stored. Unknown: a first run with tens of thousands may exceed the default Workflow step budget; later runs are incremental. |
 | **Organizations** | Install the app on an org and switch it on | Its repos are listed and backed up; nothing happens until you switch it on. |
-| **Forks and single-repo overrides** | Turn on "Include forks", or set one repo to "Always" / "Never" | Only the selected repos change. |
-| **Starred repositories** | Switch on "Starred repositories" | Your public stars are listed and their git history backed up. |
+| **Forks and single-repo switches** | Turn on "Include forks", or switch one repo on or off | Only the selected repos change. |
 | **Token mode** | In the CLI, connect GitHub with the `gh` token or a pasted token instead of the app | Repos are discovered and backed up every 6 hours, with no push webhooks. |
 | **Sync on push** | Push to a backed-up repo (GitHub App mode) | A sync starts within a couple of minutes, with trigger "push" in the repo's run list. |
 | **Losing access** | Uninstall the app from an account, or remove a repo from it | The repos show "gone from GitHub · kept" and stay cloneable from Cloudflare. |

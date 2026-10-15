@@ -219,7 +219,8 @@ function toggle(action: string, field: string, on: boolean, label: unknown, titl
 }
 
 function accountTitle(account: Account): Html {
-	if (account.kind === "starred") return html`<h2>★ Starred repositories</h2><span class="chip">public only · git history only</span>`;
+	// Left behind by older versions, which could back up starred repos.
+	if (account.kind === "starred") return html`<h2>★ Starred repositories</h2><span class="chip warn">no longer synced · backups kept</span>`;
 	return html`<h2>${account.login}</h2><span class="chip">${account.kind === "Organization" ? "organization" : "user"}</span>${account.suspended ? html`<span class="chip bad">installation suspended</span>` : ""}${account.uninstalled_at ? html`<span class="chip warn">app uninstalled · backups kept</span>` : ""}`;
 }
 
@@ -257,26 +258,31 @@ export function dashboardPage(d: DashboardData): Response {
 	<td class="muted">${bytes(repo.size_bytes === null ? null : repo.size_bytes + repo.lfs_bytes)}</td>
 </tr>`;
 		});
+		const frozen = account.kind === "starred";
 		return html`<div class="card" data-account>
 	<div class="row spread">
 		<div class="row">${accountTitle(account)}<span class="muted small">${repos.length} repos</span></div>
-		<div class="row">
+		${
+			frozen
+				? ""
+				: html`<div class="row">
 			<form method="post" action="${base}"><input type="hidden" name="select" value="all"><button type="submit" title="Switch on every repository listed here${account.include_forks ? "" : " except forks"}">Back up all</button></form>
 			<form method="post" action="${base}"><input type="hidden" name="select" value="none"><button type="submit" title="Switch off every repository listed here. Existing backups are kept.">Stop all</button></form>
-		</div>
+		</div>`
+		}
 	</div>
-	<div class="auto">
-		${
-			account.kind === "starred"
-				? toggle(base, "auto_public", account.auto_public === 1, "Back up repositories I star", "Lists your public stars and backs up new ones automatically")
-				: html`<span class="label">Automatically import new repos</span>
+	${
+		frozen
+			? ""
+			: html`<div class="auto">
+		<span class="label">Automatically import new repos</span>
 		${toggle(base, "auto_all", account.auto_public === 1 && account.auto_private === 1, "All", "New public and private repositories are backed up as soon as they appear")}
 		${toggle(base, "auto_public", account.auto_public === 1, "Public")}
 		${toggle(base, "auto_private", account.auto_private === 1, "Private")}
-		${toggle(base, "include_forks", account.include_forks === 1, "Include forks", "Whether automatic import and Back up all also take forks")}`
-		}
-	</div>
-	${repos.length ? html`<div class="scroll"><table><thead><tr><th>Repository</th><th>Backup</th><th>Status</th><th>Last success</th><th>Size</th></tr></thead><tbody>${rows}</tbody></table></div>` : html`<p class="muted small">${account.kind === "starred" ? "Switch on \"Back up repositories I star\" to list and back up your public stars." : "No repositories visible to the app here."}</p>`}
+		${toggle(base, "include_forks", account.include_forks === 1, "Include forks", "Whether automatic import and Back up all also take forks")}
+	</div>`
+	}
+	${repos.length ? html`<div class="scroll"><table><thead><tr><th>Repository</th><th>Backup</th><th>Status</th><th>Last success</th><th>Size</th></tr></thead><tbody>${rows}</tbody></table></div>` : html`<p class="muted small">No repositories visible to the app here.</p>`}
 </div>`;
 	});
 
